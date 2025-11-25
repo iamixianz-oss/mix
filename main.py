@@ -352,6 +352,13 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
     )
     return [{"timestamp": r["timestamp"].isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
 
+@app.post("/")
+async def root_post(payload: DevicePayload):
+    """
+    Accept device data directly at root URL for ESP32 (no auth required).
+    """
+    return await receive_device_data(payload)
+
 # ================== RUN APP ==================
 if __name__ == "__main__":
     import uvicorn
