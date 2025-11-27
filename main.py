@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Body
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 import databases
 import sqlalchemy
@@ -10,7 +10,10 @@ import os
 import json
 from fastapi.middleware.cors import CORSMiddleware
 
-# DATABASE CONFIG
+# ----------------- PH TIMEZONE -----------------
+PHT = timezone(timedelta(hours=8))  # UTC+8
+
+# ----------------- DATABASE CONFIG -----------------
 if "DATABASE_URL" in os.environ:
     raw_url = os.environ["DATABASE_URL"]
     if raw_url.startswith("postgres://"):
@@ -31,7 +34,7 @@ engine = sqlalchemy.create_engine(
 
 app = FastAPI(title="Seizure Monitor Backend")
 
-# TABLES
+# ----------------- TABLES -----------------
 users = sqlalchemy.Table(
     "users", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -56,7 +59,6 @@ device_data = sqlalchemy.Table(
     sqlalchemy.Column("payload", sqlalchemy.Text),
 )
 
-# NEW sensor_data table (structured columns for fast queries)
 sensor_data = sqlalchemy.Table(
     "sensor_data", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
@@ -77,15 +79,14 @@ seizure_events = sqlalchemy.Table(
     sqlalchemy.Column("device_ids", sqlalchemy.String),
 )
 
-# create tables if not exist
 metadata.create_all(engine)
 
+# ----------------- AUTH -----------------
 SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-# MODELS
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -112,7 +113,6 @@ class DevicePayload(BaseModel):
     sensors: dict
     seizure_flag: bool = False
 
-# Unified payload for ESP32 (Option C)
 class UnifiedESP32Payload(BaseModel):
     device_id: str
     timestamp_ms: int
@@ -122,7 +122,6 @@ class UnifiedESP32Payload(BaseModel):
     mag_y: int
     mag_z: int
 
-# Auth helpers (unchanged)
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
 
@@ -153,7 +152,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-# CORS
+# ----------------- CORS -----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -162,7 +161,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# lifecycle
+# ----------------- LIFECYCLE -----------------
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -175,7 +174,7 @@ async def shutdown():
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
-# USER ROUTES
+# ----------------- USER ROUTES -----------------
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
@@ -203,17 +202,15 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-# DEVICE ROUTES (unchanged)
+# ----------------- DEVICE ROUTES -----------------
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
     my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     if len(my_devices) >= 4:
         raise HTTPException(status_code=400, detail="Max 4 devices allowed per user")
-    
     existing_device = await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id))
     if existing_device:
         raise HTTPException(status_code=400, detail="Device ID already registered")
-
     await database.execute(
         devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
     )
@@ -235,7 +232,7 @@ async def get_my_devices(current_user=Depends(get_current_user)):
         if latest_data:
             payload = json.loads(latest_data["payload"])
             battery_percent = payload.get("battery_percent", 100)
-            last_sync = latest_data["timestamp"]
+            last_sync = latest_data["timestamp"].astimezone(PHT)
         output.append({
             "device_id": r["device_id"],
             "label": r["label"],
@@ -264,7 +261,7 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
     await database.execute(devices.delete().where(devices.c.id == row["id"]))
     return {"status": "deleted", "device_id": device_id}
 
-# DEVICE DATA ROUTE (for dashboard & auth clients)
+# ----------------- DEVICE DATA -----------------
 @app.post("/api/devices/data")
 async def receive_device_data(payload: DevicePayload):
     device_row = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
@@ -278,7 +275,7 @@ async def receive_device_data(payload: DevicePayload):
         payload=json.dumps(payload.dict())
     ))
 
-    # seizure aggregation logic (unchanged)
+    # seizure aggregation logic
     if payload.seizure_flag:
         user_id = device_row["user_id"]
         window_start = datetime.utcnow() - timedelta(seconds=5)
@@ -309,7 +306,7 @@ async def receive_device_data(payload: DevicePayload):
 
     return {"status": "ok"}
 
-# DEVICE HISTORY
+# ----------------- DEVICE HISTORY -----------------
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
     r = await database.fetch_one(
@@ -328,16 +325,17 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
     result = []
     for row in rows:
         payload = json.loads(row["payload"])
+        timestamp = row["timestamp"].astimezone(PHT)
         result.append({
             "id": row["id"],
             "device_id": row["device_id"],
-            "timestamp": row["timestamp"].isoformat(),
+            "timestamp": timestamp.isoformat(),
             "payload": payload,
             "battery_percent": payload.get("battery_percent", 100),
         })
     return result
 
-# USERS ADMIN
+# ----------------- USERS ADMIN -----------------
 @app.get("/api/users")
 async def list_users(current_user=Depends(get_current_user)):
     if not current_user["is_admin"]:
@@ -345,7 +343,7 @@ async def list_users(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(users.select())
     return [{"id": r["id"], "username": r["username"], "is_admin": r["is_admin"]} for r in rows]
 
-# SEIZURE EVENTS endpoints (unchanged)
+# ----------------- SEIZURE EVENTS -----------------
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -353,7 +351,7 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
         .where(seizure_events.c.user_id == current_user["id"])
         .order_by(seizure_events.c.timestamp.desc())
     )
-    return [{"timestamp": r["timestamp"].isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
+    return [{"timestamp": r["timestamp"].astimezone(PHT).isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
 
 @app.get("/api/seizure_events/latest")
 async def get_latest_event(current_user=Depends(get_current_user)):
@@ -365,30 +363,23 @@ async def get_latest_event(current_user=Depends(get_current_user)):
     )
     if not row:
         return {}
-    return {"timestamp": row["timestamp"].isoformat(), "device_ids": row["device_ids"].split(",")}
+    return {"timestamp": row["timestamp"].astimezone(PHT).isoformat(), "device_ids": row["device_ids"].split(",")}
 
 @app.get("/api/seizure_events/all")
 async def get_all_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
         seizure_events.select().order_by(seizure_events.c.timestamp.desc())
     )
-    return [{"timestamp": r["timestamp"].isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
+    return [{"timestamp": r["timestamp"].astimezone(PHT).isoformat(), "device_ids": r["device_ids"].split(",")} for r in rows]
 
-# ========== ROOT ROUTE (Fix 405 error) ==========
+# ----------------- ROOT -----------------
 @app.get("/")
 async def root():
     return {"message": "Backend running"}
 
-
+# ----------------- ESP32 UPLOAD -----------------
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
-    """
-    Public endpoint for ESP32 devices (no token). Behavior:
-    - Verify device_id exists in devices table.
-    - Insert structured row into sensor_data.
-    - Also save the raw JSON into device_data (payload column) for backwards compatibility.
-    """
-
     query = devices.select().where(devices.c.device_id == payload.device_id)
     existing = await database.fetch_one(query)
     if not existing:
@@ -396,7 +387,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 
     ts = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0)
 
-    insert_sensor = sensor_data.insert().values(
+    await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
         mag_x=payload.mag_x,
@@ -404,8 +395,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         mag_z=payload.mag_z,
         battery_percent=payload.battery_percent,
         seizure_flag=payload.seizure_flag
-    )
-    await database.execute(insert_sensor)
+    ))
 
     raw_json = {
         "device_id": payload.device_id,
@@ -422,7 +412,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         payload=json.dumps(raw_json)
     ))
 
-    # Optional: trigger same seizure aggregation logic as other route (if wanted)
+    # seizure aggregation
     if payload.seizure_flag:
         user_id = existing["user_id"]
         window_start = datetime.utcnow() - timedelta(seconds=5)
@@ -453,15 +443,9 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 
     return {"status": "saved"}
 
+# ----------------- DEVICES WITH LATEST DATA -----------------
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
-    """
-    Returns all devices for the current user along with latest sensor_data info:
-    - last_sync (timestamp)
-    - battery_percent
-    - mag_x, mag_y, mag_z
-    - connected: True/False based on last sync within 60s
-    """
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
 
@@ -474,15 +458,13 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
         )
 
         if latest_sensor:
-            last_sync = latest_sensor["timestamp"]
+            last_sync = latest_sensor["timestamp"].astimezone(PHT)
             battery_percent = latest_sensor["battery_percent"]
             mag_x = latest_sensor["mag_x"]
             mag_y = latest_sensor["mag_y"]
             mag_z = latest_sensor["mag_z"]
             seizure_flag = latest_sensor["seizure_flag"]
-
-            # Determine if device is connected (last 60s)
-            connected = (datetime.utcnow() - last_sync).total_seconds() <= 60
+            connected = (datetime.utcnow() - latest_sensor["timestamp"]).total_seconds() <= 60
         else:
             last_sync = None
             battery_percent = 100
@@ -504,8 +486,7 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
 
     return output
 
-
-
+# ----------------- RUN -----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
