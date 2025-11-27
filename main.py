@@ -379,7 +379,7 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
 async def root():
     return {"message": "Backend running"}
 
-# ========== Unified ESP32 upload endpoint ==========
+
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
     """
@@ -389,16 +389,13 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
     - Also save the raw JSON into device_data (payload column) for backwards compatibility.
     """
 
-    # Step 1: Check if device exists
     query = devices.select().where(devices.c.device_id == payload.device_id)
     existing = await database.fetch_one(query)
     if not existing:
         raise HTTPException(status_code=403, detail="Unknown device_id")
 
-    # Convert timestamp
     ts = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0)
 
-    # Step 2: Insert into sensor_data
     insert_sensor = sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
@@ -410,7 +407,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
     )
     await database.execute(insert_sensor)
 
-    # Step 3: Save into device_data (JSON payload) for compatibility
     raw_json = {
         "device_id": payload.device_id,
         "timestamp_ms": payload.timestamp_ms,
@@ -456,6 +452,52 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 ))
 
     return {"status": "saved"}
+
+@app.get("/api/mydevices_with_latest_data")
+async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
+    """
+    Returns all devices for the current user along with latest sensor_data info:
+    - last_sync (timestamp)
+    - battery_percent
+    - mag_x, mag_y, mag_z
+    """
+    user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
+    output = []
+
+    for d in user_devices:
+        latest_sensor = await database.fetch_one(
+            sensor_data.select()
+            .where(sensor_data.c.device_id == d["device_id"])
+            .order_by(sensor_data.c.timestamp.desc())
+            .limit(1)
+        )
+
+        if latest_sensor:
+            last_sync = latest_sensor["timestamp"]
+            battery_percent = latest_sensor["battery_percent"]
+            mag_x = latest_sensor["mag_x"]
+            mag_y = latest_sensor["mag_y"]
+            mag_z = latest_sensor["mag_z"]
+            seizure_flag = latest_sensor["seizure_flag"]
+        else:
+            last_sync = None
+            battery_percent = 100
+            mag_x = mag_y = mag_z = 0
+            seizure_flag = False
+
+        output.append({
+            "device_id": d["device_id"],
+            "label": d["label"],
+            "battery_percent": battery_percent,
+            "last_sync": last_sync.isoformat() if last_sync else None,
+            "mag_x": mag_x,
+            "mag_y": mag_y,
+            "mag_z": mag_z,
+            "seizure_flag": seizure_flag
+        })
+
+    return output
+
 
 if __name__ == "__main__":
     import uvicorn
