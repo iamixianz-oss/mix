@@ -347,7 +347,7 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
         result.append({
             "id": row["id"],
             "device_id": row["device_id"],
-            "timestamp": ts.strftime("%I:%M %p"),  # <- 12-hour PH time
+            "timestamp": ts.strftime("%I:%M %p"),
             "payload": payload,
             "battery_percent": payload.get("battery_percent", 100),
         })
