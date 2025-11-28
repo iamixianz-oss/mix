@@ -544,10 +544,12 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 # =======================
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
-    user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
+    user_devices = await database.fetch_all(
+        devices.select().where(devices.c.user_id == current_user["id"])
+    )
     output = []
 
-    now = now_pht_naive()
+    now = datetime.now(PHT)  # aware datetime in PHT
 
     for d in user_devices:
         latest = await database.fetch_one(
@@ -557,19 +559,24 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             .limit(1)
         )
 
+        # Handle latest sensor data
         if latest:
             ts = latest["timestamp"]
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=PHT)  # make aware if naive
             diff = (now - ts).total_seconds()
             last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
-            connected = False
         else:
-            last_sync_val = None
-            connected = False
             ts = None
+            last_sync_val = None
 
+        # Handle last_seen from device
         last_seen_val = None
+        connected = False
         if d["last_seen"]:
             last_seen_val = d["last_seen"]
+            if last_seen_val.tzinfo is None:
+                last_seen_val = last_seen_val.replace(tzinfo=PHT)
             diff_seen = (now - last_seen_val).total_seconds()
             connected = diff_seen <= 60
 
