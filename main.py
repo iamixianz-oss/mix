@@ -15,6 +15,12 @@ from fastapi.middleware.cors import CORSMiddleware
 # =======================
 PHT = timezone(timedelta(hours=8))
 
+def to_pht(dt_utc: datetime) -> datetime:
+    """Convert UTC datetime to PHT"""
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    return dt_utc.astimezone(PHT)
+
 # =======================
 #   DATABASE CONFIG
 # =======================
@@ -115,12 +121,6 @@ class DeviceRegister(BaseModel):
 class DeviceUpdate(BaseModel):
     label: str
 
-class DevicePayload(BaseModel):
-    device_id: str
-    timestamp_ms: int
-    sensors: dict
-    seizure_flag: bool = False
-
 class UnifiedESP32Payload(BaseModel):
     device_id: str
     timestamp_ms: int
@@ -154,7 +154,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             raise exc
     except JWTError:
         raise exc
-
     user = await get_user_by_username(username)
     if not user:
         raise exc
@@ -226,7 +225,6 @@ async def register_device(d: DeviceRegister, current_user=Depends(get_current_us
         raise HTTPException(status_code=400, detail="Max 4 devices allowed")
     if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
         raise HTTPException(status_code=400, detail="Device ID exists")
-
     await database.execute(
         devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
     )
@@ -236,7 +234,6 @@ async def register_device(d: DeviceRegister, current_user=Depends(get_current_us
 async def get_my_devices(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
-
     for r in rows:
         latest_data = await database.fetch_one(
             device_data.select()
@@ -244,27 +241,21 @@ async def get_my_devices(current_user=Depends(get_current_user)):
             .order_by(device_data.c.timestamp.desc())
             .limit(1)
         )
-
         battery = 100
         last_sync_val = None
-
         if latest_data:
             payload = json.loads(latest_data["payload"])
             battery = payload.get("battery_percent", 100)
-
-            ts = latest_data["timestamp"].astimezone(PHT)
+            ts = to_pht(latest_data["timestamp"])
             now = datetime.now(PHT)
             diff = (now - ts).total_seconds()
-
             last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
-
         output.append({
             "device_id": r["device_id"],
             "label": r["label"],
             "battery_percent": battery,
             "last_sync": last_sync_val
         })
-
     return output
 
 @app.put("/api/devices/{device_id}")
@@ -277,7 +268,6 @@ async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends
     )
     if not row:
         raise HTTPException(status_code=404, detail="Device not found")
-
     await database.execute(devices.update().where(devices.c.id == row["id"]).values(label=body.label))
     return {"status": "updated", "device_id": device_id, "label": body.label}
 
@@ -291,17 +281,14 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
     )
     if not row:
         raise HTTPException(status_code=404, detail="Device not found")
-
     await database.execute(devices.delete().where(devices.c.id == row["id"]))
     return {"status": "deleted", "device_id": device_id}
-
 
 # =======================
 #   DEVICE HISTORY
 # =======================
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
-
     r = await database.fetch_one(
         devices.select().where(
             (devices.c.device_id == device_id) &
@@ -310,19 +297,16 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
     )
     if not r:
         raise HTTPException(status_code=403, detail="Not your device")
-
     rows = await database.fetch_all(
         device_data.select()
         .where(device_data.c.device_id == device_id)
         .order_by(device_data.c.timestamp.desc())
         .limit(1000)
     )
-
     result = []
     for row in rows:
         payload = json.loads(row["payload"])
-        ts = row["timestamp"].astimezone(PHT)
-
+        ts = to_pht(row["timestamp"])
         result.append({
             "id": row["id"],
             "device_id": row["device_id"],
@@ -330,7 +314,6 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
             "payload": payload,
             "battery_percent": payload.get("battery_percent", 100),
         })
-
     return result
 
 # =======================
@@ -344,7 +327,7 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
         .order_by(seizure_events.c.timestamp.desc())
     )
     return [{
-        "timestamp": r["timestamp"].astimezone(PHT).isoformat(),
+        "timestamp": to_pht(r["timestamp"]).isoformat(),
         "device_ids": r["device_ids"].split(",")
     } for r in rows]
 
@@ -359,7 +342,7 @@ async def get_latest_event(current_user=Depends(get_current_user)):
     if not row:
         return {}
     return {
-        "timestamp": row["timestamp"].astimezone(PHT).isoformat(),
+        "timestamp": to_pht(row["timestamp"]).isoformat(),
         "device_ids": row["device_ids"].split(",")
     }
 
@@ -369,34 +352,37 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
         seizure_events.select().order_by(seizure_events.c.timestamp.desc())
     )
     return [{
-        "timestamp": r["timestamp"].astimezone(PHT).isoformat(),
+        "timestamp": to_pht(r["timestamp"]).isoformat(),
         "device_ids": r["device_ids"].split(",")
     } for r in rows]
-
 
 # =======================
 #   ESP32 UPLOAD
 # =======================
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
-
+    # Check if device exists
     existing = await database.fetch_one(
         devices.select().where(devices.c.device_id == payload.device_id)
     )
     if not existing:
         raise HTTPException(status_code=403, detail="Unknown device_id")
 
-    ts = datetime.fromtimestamp(payload.timestamp_ms / 1000.0, PHT)
+    # Convert milliseconds to UTC datetime
+    ts_utc = datetime.utcfromtimestamp(payload.timestamp_ms / 1000.0).replace(tzinfo=timezone.utc)
 
+    # Insert sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
-        timestamp=ts,
+        timestamp=ts_utc,
         mag_x=payload.mag_x,
         mag_y=payload.mag_y,
         mag_z=payload.mag_z,
         battery_percent=payload.battery_percent,
         seizure_flag=payload.seizure_flag
     ))
+
+    # Insert raw JSON payload
     raw_json = {
         "device_id": payload.device_id,
         "timestamp_ms": payload.timestamp_ms,
@@ -409,14 +395,14 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 
     await database.execute(device_data.insert().values(
         device_id=payload.device_id,
-        timestamp=ts,
+        timestamp=ts_utc,
         payload=json.dumps(raw_json)
     ))
 
-    # Seizure aggregation using device timestamp
+    # Handle seizure detection
     if payload.seizure_flag:
         user_id = existing["user_id"]
-        window_start = ts - timedelta(seconds=5)  # 5-second window
+        window_start = ts_utc - timedelta(seconds=5)
 
         user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
         ids = [d["device_id"] for d in user_devices]
@@ -442,7 +428,7 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
             if not recent_log:
                 await database.execute(seizure_events.insert().values(
                     user_id=user_id,
-                    timestamp=ts,  # device timestamp
+                    timestamp=ts_utc,
                     device_ids=",".join(triggered)
                 ))
 
@@ -455,7 +441,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     output = []
-
     for d in user_devices:
         latest = await database.fetch_one(
             sensor_data.select()
@@ -463,20 +448,15 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             .order_by(sensor_data.c.timestamp.desc())
             .limit(1)
         )
-
         if latest:
-            ts = latest["timestamp"].astimezone(PHT)
+            ts = to_pht(latest["timestamp"])
             now = datetime.now(PHT)
             diff = (now - ts).total_seconds()
-
             last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
-
             connected = diff <= 60
         else:
             last_sync_val = None
             connected = False
-            ts = None
-
         output.append({
             "device_id": d["device_id"],
             "label": d["label"],
@@ -488,7 +468,6 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             "seizure_flag": latest["seizure_flag"] if latest else False,
             "connected": connected
         })
-
     return output
 
 # =======================
