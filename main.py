@@ -49,12 +49,14 @@ users = sqlalchemy.Table(
     sqlalchemy.Column("is_admin", sqlalchemy.Boolean, default=False),
 )
 
+# NOTE: added last_seen column (timezone-aware) — for Postgres you must run a migration to add it
 devices = sqlalchemy.Table(
     "devices", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("user_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id")),
     sqlalchemy.Column("device_id", sqlalchemy.String, unique=True),
     sqlalchemy.Column("label", sqlalchemy.String),
+    sqlalchemy.Column("last_seen", sqlalchemy.DateTime(timezone=True), nullable=True),  # NEW
 )
 
 device_data = sqlalchemy.Table(
@@ -85,6 +87,7 @@ seizure_events = sqlalchemy.Table(
     sqlalchemy.Column("device_ids", sqlalchemy.String),
 )
 
+# Will create missing tables only. It will NOT ALTER existing tables to add columns.
 metadata.create_all(engine)
 
 # =======================
@@ -187,6 +190,37 @@ async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
 # =======================
+#   HELPER: log + update last_seen
+# =======================
+async def log_device_connection(device_id: str):
+    """Update devices.last_seen and print a server-side log including the owning username.
+
+    NOTE: For Postgres deployments you must add the `last_seen` column via migration
+    (ALTER TABLE ...) before relying on this field to exist in the DB.
+    """
+    row = await database.fetch_one(devices.select().where(devices.c.device_id == device_id))
+    if not row:
+        # Unknown device; nothing to log
+        print(f"[DEVICE CONNECT] Unknown device {device_id}")
+        return
+
+    user_row = await database.fetch_one(users.select().where(users.c.id == row["user_id"]))
+    username = user_row["username"] if user_row else "<unknown>"
+
+    now = datetime.now(PHT)
+    # Update last_seen (timezone-aware)
+    try:
+        await database.execute(
+            devices.update().where(devices.c.device_id == device_id).values(last_seen=now)
+        )
+    except Exception as e:
+        # If the column doesn't exist on the live DB, we don't want to crash the request.
+        # Print a helpful message for operators and continue.
+        print(f"[DEVICE CONNECT] Could not update last_seen for {device_id}: {e}")
+
+    print(f"[DEVICE CONNECTED] Device {device_id} belongs to user {username} (last_seen={now.isoformat()})")
+
+# =======================
 #   USER ROUTES
 # =======================
 @app.post("/api/register")
@@ -262,7 +296,8 @@ async def get_my_devices(current_user=Depends(get_current_user)):
             "device_id": r["device_id"],
             "label": r["label"],
             "battery_percent": battery,
-            "last_sync": last_sync_val
+            "last_sync": last_sync_val,
+            "last_seen": r["last_seen"].astimezone(PHT).isoformat() if r.get("last_seen") else None,
         })
 
     return output
@@ -314,6 +349,9 @@ async def receive_device_data(payload: DevicePayload):
         payload=json.dumps(payload.dict())
     ))
 
+    # Update last_seen and log connection
+    await log_device_connection(payload.device_id)
+
     # Seizure detection using device timestamps, not server time
     if payload.seizure_flag:
         user_id = device_row["user_id"]
@@ -348,9 +386,6 @@ async def receive_device_data(payload: DevicePayload):
                 ))
 
     return {"status": "ok"}
-
-
-
 
 # =======================
 #   DEVICE HISTORY
@@ -473,6 +508,9 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         payload=json.dumps(raw_json)
     ))
 
+    # Update last_seen and log connection
+    await log_device_connection(payload.device_id)
+
     # Seizure aggregation using device timestamp
     if payload.seizure_flag:
         user_id = existing["user_id"]
@@ -531,17 +569,25 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
 
             last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
 
-            connected = diff <= 60
+            connected = False
         else:
             last_sync_val = None
             connected = False
             ts = None
+
+        # Evaluate connection using devices.last_seen when available (preferred)
+        last_seen_val = None
+        if d.get("last_seen"):
+            last_seen_val = d["last_seen"].astimezone(PHT)
+            diff_seen = (datetime.now(PHT) - last_seen_val).total_seconds()
+            connected = diff_seen <= 60
 
         output.append({
             "device_id": d["device_id"],
             "label": d["label"],
             "battery_percent": latest["battery_percent"] if latest else 100,
             "last_sync": last_sync_val,
+            "last_seen": last_seen_val.isoformat() if last_seen_val else None,
             "mag_x": latest["mag_x"] if latest else 0,
             "mag_y": latest["mag_y"] if latest else 0,
             "mag_z": latest["mag_z"] if latest else 0,
