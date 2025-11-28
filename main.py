@@ -159,7 +159,7 @@ class DeviceRegister(BaseModel):
 class DeviceUpdate(BaseModel):
     label: str
 
-class UnifiedESP32Payload(BaseModel):
+class ArduinoPayload(BaseModel):
     device_id: str
     timestamp_ms: int
     battery_percent: int
@@ -182,6 +182,9 @@ def is_connected(last_seen: datetime, timeout: int = 60):
         return False
     last_seen = make_aware(last_seen)
     return (now_pht() - last_seen).total_seconds() <= timeout
+
+def timestamp_ms_to_pht(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=PHT)
 
 # =======================
 # ROUTES
@@ -238,15 +241,16 @@ async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends
 # -----------------------
 # DEVICE DATA UPLOAD
 @app.post("/api/device/upload")
-async def upload_from_esp(payload: UnifiedESP32Payload):
+async def upload_from_arduino(payload: ArduinoPayload):
+    # 1️⃣ Verify device_id
     device = await database.fetch_one(devices.select().where(devices.c.device_id == payload.device_id))
     if not device:
-        raise HTTPException(status_code=403, detail="Unknown device")
+        raise HTTPException(status_code=403, detail="Device not registered")
 
-    # ✅ Convert timestamp from ESP32 using PH time ONLY
-    ts = datetime.fromtimestamp(payload.timestamp_ms / 1000.0, tz=PHT)
+    # 2️⃣ Convert Arduino timestamp to tz-aware PHT
+    ts = timestamp_ms_to_pht(payload.timestamp_ms)
 
-    # Save sensor data
+    # 3️⃣ Save sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts,
@@ -257,39 +261,10 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         seizure_flag=payload.seizure_flag
     ))
 
-    # Update last_seen based on ESP32 timestamp
+    # 4️⃣ Update device last_seen
     await log_device_connection(payload.device_id, ts)
 
-    # Seizure detection (window=5s, trigger if 3 devices report seizure)
-    if payload.seizure_flag:
-        user_id = device["user_id"]
-        window_start = ts - timedelta(seconds=5)
-        user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
-        ids = [d["device_id"] for d in user_devices]
-
-        recent_rows = await database.fetch_all(
-            sensor_data.select()
-            .where(sensor_data.c.device_id.in_(ids))
-            .where(sensor_data.c.timestamp >= window_start)
-        )
-
-        triggered = list({r["device_id"] for r in recent_rows if r["seizure_flag"]})
-
-        if len(triggered) >= 3:
-            existing_event = await database.fetch_one(
-                seizure_events.select()
-                .where(seizure_events.c.user_id == user_id)
-                .where(seizure_events.c.timestamp >= window_start)
-            )
-            if not existing_event:
-                await database.execute(seizure_events.insert().values(
-                    user_id=user_id,
-                    timestamp=ts,
-                    device_ids=",".join(triggered)
-                ))
-
-    return {"status": "saved"}
-
+    return {"status": "saved", "timestamp": ts.isoformat()}
 # -----------------------
 # DEVICES + LATEST DATA
 @app.get("/api/mydevices_with_latest_data")
