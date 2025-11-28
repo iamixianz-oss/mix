@@ -9,7 +9,6 @@ import databases
 import json
 import os
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 # =======================
 # PH TIMEZONE
@@ -52,14 +51,14 @@ devices = sqlalchemy.Table(
     sqlalchemy.Column("user_id", sqlalchemy.Integer, sqlalchemy.ForeignKey("users.id")),
     sqlalchemy.Column("device_id", sqlalchemy.String, unique=True),
     sqlalchemy.Column("label", sqlalchemy.String),
-    sqlalchemy.Column("last_seen", sqlalchemy.DateTime, nullable=True),  # PH timezone aware
+    sqlalchemy.Column("last_seen", sqlalchemy.DateTime, nullable=True),
 )
 
 sensor_data = sqlalchemy.Table(
     "sensor_data", metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
-    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),  # PH timezone aware
+    sqlalchemy.Column("timestamp", sqlalchemy.DateTime, index=True),
     sqlalchemy.Column("mag_x", sqlalchemy.Integer),
     sqlalchemy.Column("mag_y", sqlalchemy.Integer),
     sqlalchemy.Column("mag_z", sqlalchemy.Integer),
@@ -84,13 +83,6 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "CHANGE_THIS_SECRET")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(password: str):
-    return pwd_context.hash(password)
-
-def verify_password(plain_password, hashed):
-    return pwd_context.verify(plain_password, hashed)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -103,7 +95,7 @@ async def get_user_by_username(username: str):
 
 async def authenticate_user(username: str, password: str):
     user = await get_user_by_username(username)
-    if not user or not verify_password(password, user["password"]):
+    if not user or password != user["password"]:
         return None
     return user
 
@@ -199,7 +191,7 @@ async def register(u: UserCreate):
         raise HTTPException(status_code=400, detail="Username exists")
     user_id = await database.execute(users.insert().values(
         username=u.username,
-        password=hash_password(u.password),
+        password=u.password,
         is_admin=u.is_admin
     ))
     return {"id": user_id, "username": u.username}
