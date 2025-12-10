@@ -308,8 +308,13 @@ async def get_event_sensor_data(user_id: int, start: str, end: Optional[str] = N
     if not current_user["is_admin"]:
         raise HTTPException(status_code=403, detail="Admins only")
 
-    start_dt = datetime.fromisoformat(start)
-    end_dt = datetime.fromisoformat(end) if end else None
+    start_dt_naive = datetime.fromisoformat(start)
+    start_dt_utc = start_dt_naive.replace(tzinfo=PHT).astimezone(timezone.utc)
+
+    end_dt_utc = None
+    if end:
+        end_dt_naive = datetime.fromisoformat(end)
+        end_dt_utc = end_dt_naive.replace(tzinfo=PHT).astimezone(timezone.utc)
 
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
     device_ids = [d["device_id"] for d in user_devices]
@@ -317,19 +322,19 @@ async def get_event_sensor_data(user_id: int, start: str, end: Optional[str] = N
     query = sensor_data.select().where(
         and_(
             sensor_data.c.device_id.in_(device_ids),
-            sensor_data.c.timestamp >= start_dt,
+            sensor_data.c.timestamp >= start_dt_utc,
         )
     )
 
-    if end_dt:
-        query = query.where(sensor_data.c.timestamp <= end_dt)
+    if end_dt_utc:
+        query = query.where(sensor_data.c.timestamp <= end_dt_utc)
 
     rows = await database.fetch_all(query.order_by(sensor_data.c.timestamp.asc()))
 
     result = []
     for r in rows:
         result.append({
-            "timestamp": ts_pht_iso(r["timestamp"]),
+            "timestamp": ts_pht_iso(r["timestamp"]), 
             "mag_x": r["mag_x"],
             "mag_y": r["mag_y"],
             "mag_z": r["mag_z"],
