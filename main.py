@@ -408,7 +408,6 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-
 # DEVICE ROUTES
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
@@ -568,18 +567,18 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
     user_devices = await database.fetch_all(devices.select().where(devices.c.user_id == user_id))
     device_ids = [d["device_id"] for d in user_devices]
 
-    time_window = ts_utc - timedelta(seconds=3)
-
-    triggered_count = 0
+    recent_rows = []
     for did in device_ids:
-        rows = await database.fetch_all(
+        row = await database.fetch_one(
             sensor_data.select()
             .where(sensor_data.c.device_id == did)
-            .where(sensor_data.c.timestamp >= time_window)
+            .order_by(sensor_data.c.timestamp.desc())
+            .limit(1)
         )
+        if row:
+            recent_rows.append(row)
 
-        if any(r["seizure_flag"] for r in rows):
-            triggered_count += 1
+    triggered_count = sum(1 for r in recent_rows if r["seizure_flag"])
 
     if triggered_count >= 3:
         active_session = await get_active_user_seizure(user_id, "GTCS")
