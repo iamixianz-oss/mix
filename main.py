@@ -516,6 +516,10 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 #DEVICE HISTORY
 def ts_pht_iso(dt_utc: datetime) -> str:
     return to_pht(dt_utc).isoformat()
+def ts_pht_human(dt_utc: datetime) -> str:
+    """Return PH time formatted like 'MM/DD/YYYY HH:MM AM/PM'"""
+    dt = to_pht(dt_utc)
+    return dt.strftime("%m/%d/%Y %I:%M %p")
 
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
@@ -541,7 +545,7 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
         result.append({
             "id": row["id"],
             "device_id": row["device_id"],
-            "timestamp": ts_pht_iso(row["timestamp"]),
+            "timestamp": ts_pht_human(row["timestamp"]),  # <-- human readable PH time
             "mag_x": payload.get("mag_x"),
             "mag_y": payload.get("mag_y"),
             "mag_z": payload.get("mag_z"),
