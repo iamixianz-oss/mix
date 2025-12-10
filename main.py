@@ -12,6 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 
 PHT = timezone(timedelta(hours=8))
+def format_pht_human(dt_utc: datetime) -> Optional[str]:
+    if not dt_utc:
+        return None
+    dt = to_pht(dt_utc)
+    return dt.strftime("%-m/%-d/%Y at %-I:%M %p")
 
 def to_pht(dt_utc: datetime) -> datetime:
     if dt_utc.tzinfo is None:
@@ -276,8 +281,8 @@ async def admin_get_user_events(user_id: int, current_user=Depends(get_current_u
     for r in rows:
         result.append({
             "type": r["type"],
-            "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
+            "start": format_pht_human(r["start_time"]),
+            "end": format_pht_human(r["end_time"]) if r["end_time"] else None
         })
     return result
 
@@ -338,8 +343,8 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
     )
     result = []
     for r in rows:
-        start = ts_pht_iso(r["start_time"])
-        end = ts_pht_iso(r["end_time"]) if r["end_time"] else None
+        start = format_pht_human(r["start_time"])
+        end = format_pht_human(r["end_time"]) if r["end_time"] else None
         result.append({
             "type": r["type"],
             "start": start,
@@ -359,8 +364,8 @@ async def get_latest_event(current_user=Depends(get_current_user)):
         r = rows[0]
         return {
             "type": r["type"],
-            "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
+            "start": format_pht_human(r["start_time"]),
+            "end": format_pht_human(r["end_time"]) if r["end_time"] else None
         }
     return {}
 
@@ -375,8 +380,8 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
     for r in rows:
         result.append({
             "type": r["type"],
-            "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
+            "start": format_pht_human(r["start_time"]),
+            "end": format_pht_human(r["end_time"]) if r["end_time"] else None
         })
     return result
 
@@ -406,6 +411,39 @@ async def get_me(current_user=Depends(get_current_user)):
         "id": current_user["id"],
         "username": current_user["username"],
         "is_admin": current_user["is_admin"],
+    }
+    
+@app.get("/api/seizures/gtcs/today")
+async def get_gtcs_today(current_user=Depends(get_current_user)):
+    now = datetime.now(PHT)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    rows = await database.fetch_all(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == current_user["id"])
+        .where(user_seizure_sessions.c.type == "GTCS")
+        .where(user_seizure_sessions.c.start_time >= start_of_day)
+    )
+
+    return {"gtcs_today": len(rows)}
+
+@app.get("/api/seizures/gtcs/last")
+async def get_last_gtcs(current_user=Depends(get_current_user)):
+    row = await database.fetch_one(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == current_user["id"])
+        .where(user_seizure_sessions.c.type == "GTCS")
+        .order_by(user_seizure_sessions.c.start_time.desc())
+        .limit(1)
+    )
+
+    if not row:
+        return {"last_gtcs": None}
+
+    return {
+        "type": "GTCS",
+        "start": format_pht_human(row["start_time"]),
+        "end": format_pht_human(row["end_time"])
     }
 
 # DEVICE ROUTES
