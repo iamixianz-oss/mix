@@ -349,20 +349,34 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
 
 @app.get("/api/seizure_events/latest")
 async def get_latest_event(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(
+    active_rows = await database.fetch_all(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == current_user["id"])
+        .where(user_seizure_sessions.c.end_time == None)
         .order_by(user_seizure_sessions.c.start_time.desc())
         .limit(1)
     )
-    if rows:
-        r = rows[0]
-        return {
-            "type": r["type"],
-            "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
-        }
-    return {}
+
+    if active_rows:
+        r = active_rows[0]
+    else:
+        latest_rows = await database.fetch_all(
+            user_seizure_sessions.select()
+            .where(user_seizure_sessions.c.user_id == current_user["id"])
+            .order_by(user_seizure_sessions.c.start_time.desc())
+            .limit(1)
+        )
+        if latest_rows:
+            r = latest_rows[0]
+        else:
+            return {}
+            
+    return {
+        "type": r["type"],
+        "start": ts_pht_iso(r["start_time"]),
+        "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
+    }
+
 
 @app.get("/api/seizure_events/all")
 async def get_all_seizure_events(current_user=Depends(get_current_user)):
