@@ -12,11 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 
 PHT = timezone(timedelta(hours=8))
-def format_pht_human(dt_utc: datetime) -> Optional[str]:
-    if not dt_utc:
-        return None
-    dt = to_pht(dt_utc)
-    return dt.strftime("%-m/%-d/%Y at %-I:%M %p")
 
 def to_pht(dt_utc: datetime) -> datetime:
     if dt_utc.tzinfo is None:
@@ -412,39 +407,7 @@ async def get_me(current_user=Depends(get_current_user)):
         "username": current_user["username"],
         "is_admin": current_user["is_admin"],
     }
-    
-@app.get("/api/seizures/gtcs/today")
-async def get_gtcs_today(current_user=Depends(get_current_user)):
-    now = datetime.now(PHT)
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    rows = await database.fetch_all(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.user_id == current_user["id"])
-        .where(user_seizure_sessions.c.type == "GTCS")
-        .where(user_seizure_sessions.c.start_time >= start_of_day)
-    )
-
-    return {"gtcs_today": len(rows)}
-
-@app.get("/api/seizures/gtcs/last")
-async def get_last_gtcs(current_user=Depends(get_current_user)):
-    row = await database.fetch_one(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.user_id == current_user["id"])
-        .where(user_seizure_sessions.c.type == "GTCS")
-        .order_by(user_seizure_sessions.c.start_time.desc())
-        .limit(1)
-    )
-
-    if not row:
-        return {"last_gtcs": None}
-
-    return {
-        "type": "GTCS",
-        "start": ts_pht_iso(row["start_time"]),
-        "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None
-    }
 
 # DEVICE ROUTES
 @app.post("/api/devices/register")
@@ -516,10 +479,6 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
 #DEVICE HISTORY
 def ts_pht_iso(dt_utc: datetime) -> str:
     return to_pht(dt_utc).isoformat()
-def ts_pht_human(dt_utc: datetime) -> str:
-    """Return PH time formatted like 'MM/DD/YYYY HH:MM AM/PM'"""
-    dt = to_pht(dt_utc)
-    return dt.strftime("%m/%d/%Y %I:%M %p")
 
 @app.get("/api/devices/{device_id}", response_model=List[dict])
 async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
@@ -545,7 +504,7 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
         result.append({
             "id": row["id"],
             "device_id": row["device_id"],
-            "timestamp": ts_pht_human(row["timestamp"]),  # <-- human readable PH time
+            "timestamp": ts_pht_iso(row["timestamp"]),
             "mag_x": payload.get("mag_x"),
             "mag_y": payload.get("mag_y"),
             "mag_z": payload.get("mag_z"),
