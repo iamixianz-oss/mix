@@ -16,7 +16,6 @@ from fastapi.responses import StreamingResponse
 import csv
 import io
 
-
 PHT = timezone(timedelta(hours=8))
 
 def to_pht(dt_utc: datetime) -> datetime:
@@ -138,7 +137,6 @@ class UnifiedESP32Payload(BaseModel):
     mag_y: int
     mag_z: int
 
-#HELPER FUNCTIONS
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
 
@@ -205,7 +203,6 @@ async def shutdown():
 async def health_check():
     return {"status": "ok", "db": DATABASE_URL}
 
-#DEVICE CONNECTION LOGGING
 device_states = {}
 async def log_device_status_changes():
     while True:
@@ -236,9 +233,6 @@ async def log_device_status_changes():
 
         await asyncio.sleep(1)
 
-
-
-# ADMIN ROUTES
 @app.get("/api/users")
 async def get_all_users(current_user=Depends(get_current_user)):
     if not current_user["is_admin"]:
@@ -255,7 +249,6 @@ async def get_all_users(current_user=Depends(get_current_user)):
 
     return result
 
-
 @app.get("/api/admin/user/{user_id}/devices")
 async def admin_get_user_devices(user_id: int, current_user=Depends(get_current_user)):
     if not current_user["is_admin"]:
@@ -265,7 +258,6 @@ async def admin_get_user_devices(user_id: int, current_user=Depends(get_current_
         devices.select().where(devices.c.user_id == user_id)
     )
     return rows
-
 
 @app.get("/api/admin/user/{user_id}/events")
 async def admin_get_user_events(user_id: int, current_user=Depends(get_current_user)):
@@ -286,8 +278,6 @@ async def admin_get_user_events(user_id: int, current_user=Depends(get_current_u
             "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
         })
     return result
-
-
 
 @app.delete("/api/delete_user/{user_id}")
 async def delete_user(user_id: int, current_user=Depends(get_current_user)):
@@ -347,7 +337,6 @@ async def get_event_sensor_data(user_id: int, start: str, end: Optional[str] = N
         })
     return result
 
-# SEIZURE EVENTS
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -396,7 +385,6 @@ async def get_latest_event(current_user=Depends(get_current_user)):
         "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
     }
 
-
 @app.get("/api/seizure_events/all")
 async def get_all_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -413,7 +401,6 @@ async def get_all_seizure_events(current_user=Depends(get_current_user)):
         })
     return result
 
-#USER ROUTES
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
@@ -441,7 +428,6 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-# DEVICE ROUTES
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
     my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
@@ -508,7 +494,6 @@ async def delete_device(device_id: str, current_user=Depends(get_current_user)):
     await database.execute(devices.delete().where(devices.c.id == row["id"]))
     return {"status": "deleted", "device_id": device_id}
 
-#DEVICE HISTORY
 def ts_pht_iso(dt_utc: datetime) -> str:
     dt_pht = to_pht(dt_utc)
     return dt_pht.strftime("%Y-%m-%dT%H:%M:%S")
@@ -547,9 +532,6 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
 
     return result
 
-
-
-#DEVICE UPLOAD
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
     existing = await database.fetch_one(
@@ -652,8 +634,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
 
     return {"status": "saved"}
 
-
-# LATEST SENSOR DATA
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(
@@ -690,7 +670,6 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
         })
     return output
 
-# DOWNLOAD ROUTE
 @app.get("/api/seizure_events/download")
 async def download_seizure_history(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
