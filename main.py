@@ -614,28 +614,54 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 await database.execute(user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == jerk_session["id"])
                     .values(end_time=ts_utc))
+            
+            return {"status": "saved"}
 
     # Jerk: 1-2 devices with seizure activity (isolated spikes)
-    elif devices_with_seizure >= 1:
-        active_gtcs = await get_active_user_seizure(user_id, "GTCS")
-        if not active_gtcs:
-            active_jerk = await get_active_user_seizure(user_id, "Jerk")
-            if not active_jerk:
-                await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id,
-                    type="Jerk",
-                    start_time=ts_utc,
-                    end_time=None
-                ))
+    # BUT ONLY if there's NO active GTCS
+    active_gtcs = await get_active_user_seizure(user_id, "GTCS")
+    if not active_gtcs and devices_with_seizure >= 1:
+        # Check if GTCS ended recently (within 30 seconds)
+        # If it did, extend GTCS instead of creating Jerk
+        recent_gtcs = await database.fetch_one(
+            user_seizure_sessions.select()
+            .where(user_seizure_sessions.c.user_id == user_id)
+            .where(user_seizure_sessions.c.type == "GTCS")
+            .where(user_seizure_sessions.c.end_time != None)
+            .order_by(user_seizure_sessions.c.end_time.desc())
+            .limit(1)
+        )
+        
+        if recent_gtcs and recent_gtcs["end_time"]:
+            time_since_gtcs_end = (ts_utc - recent_gtcs["end_time"]).total_seconds()
+            # If GTCS ended less than 30 seconds ago, re-open it instead of creating Jerk
+            if time_since_gtcs_end < 30:
+                await database.execute(
+                    user_seizure_sessions.update()
+                    .where(user_seizure_sessions.c.id == recent_gtcs["id"])
+                    .values(end_time=None)  # Re-open GTCS
+                )
+                return {"status": "saved"}
+        
+        # Only create Jerk if GTCS didn't end recently
+        active_jerk = await get_active_user_seizure(user_id, "Jerk")
+        if not active_jerk:
+            await database.execute(user_seizure_sessions.insert().values(
+                user_id=user_id,
+                type="Jerk",
+                start_time=ts_utc,
+                end_time=None
+            ))
+        
+        return {"status": "saved"}
 
-    # No seizure activity: end sessions
-    else:
-        for stype in ["GTCS", "Jerk"]:
-            session = await get_active_user_seizure(user_id, stype)
-            if session:
-                await database.execute(user_seizure_sessions.update()
-                    .where(user_seizure_sessions.c.id == session["id"])
-                    .values(end_time=ts_utc))
+    # No seizure activity: end any active sessions
+    for stype in ["GTCS", "Jerk"]:
+        session = await get_active_user_seizure(user_id, stype)
+        if session:
+            await database.execute(user_seizure_sessions.update()
+                .where(user_seizure_sessions.c.id == session["id"])
+                .values(end_time=ts_utc))
 
     return {"status": "saved"}
 
