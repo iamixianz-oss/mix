@@ -11,7 +11,7 @@ import json
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from sqlalchemy import and_
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import csv
 import io
 import math
@@ -75,14 +75,12 @@ sensor_data = sqlalchemy.Table(
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
     sqlalchemy.Column("timestamp", sqlalchemy.DateTime(timezone=True)),
-    # Raw sensor data
     sqlalchemy.Column("accel_x", sqlalchemy.Float),
     sqlalchemy.Column("accel_y", sqlalchemy.Float),
     sqlalchemy.Column("accel_z", sqlalchemy.Float),
     sqlalchemy.Column("gyro_x", sqlalchemy.Float),
     sqlalchemy.Column("gyro_y", sqlalchemy.Float),
     sqlalchemy.Column("gyro_z", sqlalchemy.Float),
-    # Computed magnitudes
     sqlalchemy.Column("mag_x", sqlalchemy.Integer),
     sqlalchemy.Column("mag_y", sqlalchemy.Integer),
     sqlalchemy.Column("mag_z", sqlalchemy.Integer),
@@ -157,10 +155,7 @@ class UnifiedESP32Payload(BaseModel):
     gyro_y: float
     gyro_z: float
 
-# ============= SEIZURE DETECTION HELPER FUNCTIONS =============
-
 async def count_recent_seizure_readings(device_id: str, time_window_seconds: int = 5) -> int:
-    """Count consecutive seizure_flag=true readings in recent time window"""
     cutoff_time = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(seconds=time_window_seconds)
     rows = await database.fetch_all(
         sensor_data.select()
@@ -174,7 +169,6 @@ async def count_recent_seizure_readings(device_id: str, time_window_seconds: int
     return len(rows)
 
 async def get_recent_seizure_data(device_ids: list, time_window_seconds: int = 5) -> dict:
-    """Get seizure flag status for all devices in recent time window"""
     device_seizure_counts = {}
     for device_id in device_ids:
         count = await count_recent_seizure_readings(device_id, time_window_seconds)
@@ -187,8 +181,6 @@ async def get_recent_seizure_data(device_ids: list, time_window_seconds: int = 5
         'devices_with_seizure': devices_with_seizure,
         'device_seizure_counts': device_seizure_counts
     }
-
-# ============= AUTH FUNCTIONS =============
 
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
@@ -287,8 +279,6 @@ async def log_device_status_changes():
             device_states[d["device_id"]] = connected
         await asyncio.sleep(1)
 
-# ============= PUBLIC ENDPOINTS =============
-
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
@@ -316,19 +306,34 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-# ============= DEVICE ENDPOINTS =============
-
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
+    print(f"[DEVICE REGISTER] User {current_user['username']} registering device: {d.device_id}")
+    
     my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
     if len(my_devices) >= 4:
+        print(f"[DEVICE REGISTER] ❌ User has {len(my_devices)} devices (max 4)")
         raise HTTPException(status_code=400, detail="Max 4 devices allowed")
-    if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
+    
+    existing = await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id))
+    if existing:
+        print(f"[DEVICE REGISTER] ❌ Device {d.device_id} already exists")
         raise HTTPException(status_code=400, detail="Device ID exists")
-    await database.execute(
-        devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
+    
+    device_id = await database.execute(
+        devices.insert().values(
+            user_id=current_user["id"], 
+            device_id=d.device_id, 
+            label=d.label or d.device_id
+        )
     )
-    return {"status": "ok", "device_id": d.device_id}
+    
+    print(f"[DEVICE REGISTER] ✅ Device {d.device_id} registered successfully with DB ID {device_id}")
+    
+    return JSONResponse(
+        status_code=200,
+        content={"status": "ok", "device_id": d.device_id, "id": device_id}
+    )
 
 @app.get("/api/mydevices")
 async def get_my_devices(current_user=Depends(get_current_user)):
@@ -360,9 +365,14 @@ async def get_my_devices(current_user=Depends(get_current_user)):
 
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
+    print(f"[FETCH DEVICES] User {current_user['username']} (ID: {current_user['id']}) fetching devices")
+    
     user_devices = await database.fetch_all(
         devices.select().where(devices.c.user_id == current_user["id"])
     )
+    
+    print(f"[FETCH DEVICES] Found {len(user_devices)} devices in database")
+    
     output = []
     now = datetime.now(PHT)
     for d in user_devices:
@@ -380,7 +390,8 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
         else:
             last_sync_val = None
             connected = False
-        output.append({
+        
+        device_data_obj = {
             "device_id": d["device_id"],
             "label": d["label"],
             "battery_percent": latest["battery_percent"] if latest else 100,
@@ -390,8 +401,12 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             "mag_z": latest["mag_z"] if latest else 0,
             "seizure_flag": latest["seizure_flag"] if latest else False,
             "connected": connected
-        })
-    return output
+        }
+        output.append(device_data_obj)
+        print(f"[FETCH DEVICES] - {d['device_id']} ({d['label']}) - Connected: {connected}")
+    
+    print(f"[FETCH DEVICES] Returning {len(output)} devices to client")
+    return JSONResponse(status_code=200, content=output)
 
 @app.put("/api/devices/{device_id}")
 async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends(get_current_user)):
@@ -445,8 +460,6 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
             "seizure_flag": row["seizure_flag"]
         })
     return result
-
-# ============= SEIZURE EVENTS ENDPOINTS =============
 
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
@@ -540,14 +553,13 @@ async def download_seizure_history(current_user=Depends(get_current_user)):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-# ============= DATA UPLOAD ENDPOINT (WITH MAGNITUDE COMPUTATION) =============
-
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
     existing = await database.fetch_one(
         devices.select().where(devices.c.device_id == payload.device_id)
     )
     if not existing:
+        print(f"[DATA UPLOAD] ❌ Unknown device: {payload.device_id}")
         raise HTTPException(status_code=403, detail="Unknown device_id")
 
     ts_val = payload.timestamp_ms
@@ -555,7 +567,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         ts_val = ts_val / 1000.0
     ts_utc = datetime.utcfromtimestamp(ts_val).replace(tzinfo=timezone.utc)
 
-    # Compute magnitudes
     accel_magnitude = math.sqrt(
         payload.accel_x**2 + payload.accel_y**2 + payload.accel_z**2
     )
@@ -563,12 +574,10 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         payload.gyro_x**2 + payload.gyro_y**2 + payload.gyro_z**2
     )
     
-    # Convert to integers (scaled by 100 for precision)
     mag_x = int(accel_magnitude * 100)
     mag_y = int(gyro_magnitude * 100)
     mag_z = 0
 
-    # Save sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
@@ -591,7 +600,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         payload=json.dumps(payload.dict())
     ))
 
-    # Device-level seizure tracking
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
         if not active_device:
@@ -610,20 +618,17 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 .values(end_time=ts_utc)
             )
 
-    # User-level seizure detection (IMPROVED)
     user_id = existing["user_id"]
     user_devices = await database.fetch_all(
         devices.select().where(devices.c.user_id == user_id)
     )
     device_ids = [d["device_id"] for d in user_devices]
 
-    # Get recent seizure data (last 5 seconds)
     seizure_data = await get_recent_seizure_data(device_ids, time_window_seconds=5)
     
     devices_with_seizure = seizure_data['devices_with_seizure']
     device_seizure_counts = seizure_data['device_seizure_counts']
 
-    # GTCS: 3+ devices with continuous seizure activity (2+ consecutive readings)
     if devices_with_seizure >= 3:
         continuous_seizure_devices = sum(
             1 for count in device_seizure_counts.values() if count >= 2
@@ -647,12 +652,8 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
             
             return {"status": "saved"}
 
-    # Jerk: 1-2 devices with seizure activity (isolated spikes)
-    # BUT ONLY if there's NO active GTCS
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if not active_gtcs and devices_with_seizure >= 1:
-        # Check if GTCS ended recently (within 30 seconds)
-        # If it did, extend GTCS instead of creating Jerk
         recent_gtcs = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
@@ -664,16 +665,14 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         
         if recent_gtcs and recent_gtcs["end_time"]:
             time_since_gtcs_end = (ts_utc - recent_gtcs["end_time"]).total_seconds()
-            # If GTCS ended less than 30 seconds ago, re-open it instead of creating Jerk
             if time_since_gtcs_end < 30:
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == recent_gtcs["id"])
-                    .values(end_time=None)  # Re-open GTCS
+                    .values(end_time=None)
                 )
                 return {"status": "saved"}
         
-        # Only create Jerk if GTCS didn't end recently
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if not active_jerk:
             await database.execute(user_seizure_sessions.insert().values(
@@ -685,7 +684,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         
         return {"status": "saved"}
 
-    # No seizure activity: end any active sessions
     for stype in ["GTCS", "Jerk"]:
         session = await get_active_user_seizure(user_id, stype)
         if session:
@@ -694,8 +692,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 .values(end_time=ts_utc))
 
     return {"status": "saved"}
-
-# ============= ADMIN ENDPOINTS =============
 
 @app.get("/api/users")
 async def get_all_users(current_user=Depends(get_current_user)):
@@ -784,6 +780,17 @@ async def delete_user(user_id: int, current_user=Depends(get_current_user)):
     delete_user_query = users.delete().where(users.c.id == user_id)
     await database.execute(delete_user_query)
     return {"detail": f"User {user['username']} deleted successfully"}
+
+@app.get("/api/debug/devices/{user_id}")
+async def debug_devices(user_id: int):
+    """Debug endpoint - check what's in database"""
+    rows = await database.fetch_all(
+        devices.select().where(devices.c.user_id == user_id)
+    )
+    return {
+        "count": len(rows),
+        "devices": [dict(r) for r in rows]
+    }
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
