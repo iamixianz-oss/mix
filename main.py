@@ -14,6 +14,7 @@ from sqlalchemy import and_
 from fastapi.responses import StreamingResponse
 import csv
 import io
+import math
 
 PHT = timezone(timedelta(hours=8))
 
@@ -74,6 +75,14 @@ sensor_data = sqlalchemy.Table(
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
     sqlalchemy.Column("timestamp", sqlalchemy.DateTime(timezone=True)),
+    # Raw sensor data
+    sqlalchemy.Column("accel_x", sqlalchemy.Float),
+    sqlalchemy.Column("accel_y", sqlalchemy.Float),
+    sqlalchemy.Column("accel_z", sqlalchemy.Float),
+    sqlalchemy.Column("gyro_x", sqlalchemy.Float),
+    sqlalchemy.Column("gyro_y", sqlalchemy.Float),
+    sqlalchemy.Column("gyro_z", sqlalchemy.Float),
+    # Computed magnitudes
     sqlalchemy.Column("mag_x", sqlalchemy.Integer),
     sqlalchemy.Column("mag_y", sqlalchemy.Integer),
     sqlalchemy.Column("mag_z", sqlalchemy.Integer),
@@ -141,9 +150,12 @@ class UnifiedESP32Payload(BaseModel):
     timestamp_ms: int
     battery_percent: int
     seizure_flag: bool
-    mag_x: int
-    mag_y: int
-    mag_z: int
+    accel_x: float
+    accel_y: float
+    accel_z: float
+    gyro_x: float
+    gyro_y: float
+    gyro_z: float
 
 # ============= SEIZURE DETECTION HELPER FUNCTIONS =============
 
@@ -415,23 +427,22 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
     if not r:
         raise HTTPException(status_code=403, detail="Not your device")
     rows = await database.fetch_all(
-        device_data.select()
-        .where(device_data.c.device_id == device_id)
-        .order_by(device_data.c.timestamp.desc())
+        sensor_data.select()
+        .where(sensor_data.c.device_id == device_id)
+        .order_by(sensor_data.c.timestamp.desc())
         .limit(1000)
     )
     result = []
     for row in rows:
-        payload = json.loads(row["payload"])
         result.append({
             "id": row["id"],
             "device_id": row["device_id"],
             "timestamp": ts_pht_iso(row["timestamp"]),
-            "mag_x": payload.get("mag_x"),
-            "mag_y": payload.get("mag_y"),
-            "mag_z": payload.get("mag_z"),
-            "battery_percent": payload.get("battery_percent", 100),
-            "seizure_flag": payload.get("seizure_flag", False)
+            "mag_x": row["mag_x"],
+            "mag_y": row["mag_y"],
+            "mag_z": row["mag_z"],
+            "battery_percent": row["battery_percent"],
+            "seizure_flag": row["seizure_flag"]
         })
     return result
 
@@ -529,7 +540,7 @@ async def download_seizure_history(current_user=Depends(get_current_user)):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-# ============= DATA UPLOAD ENDPOINT (WITH IMPROVED SEIZURE DETECTION) =============
+# ============= DATA UPLOAD ENDPOINT (WITH MAGNITUDE COMPUTATION) =============
 
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
@@ -544,13 +555,32 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         ts_val = ts_val / 1000.0
     ts_utc = datetime.utcfromtimestamp(ts_val).replace(tzinfo=timezone.utc)
 
+    # Compute magnitudes
+    accel_magnitude = math.sqrt(
+        payload.accel_x**2 + payload.accel_y**2 + payload.accel_z**2
+    )
+    gyro_magnitude = math.sqrt(
+        payload.gyro_x**2 + payload.gyro_y**2 + payload.gyro_z**2
+    )
+    
+    # Convert to integers (scaled by 100 for precision)
+    mag_x = int(accel_magnitude * 100)
+    mag_y = int(gyro_magnitude * 100)
+    mag_z = 0
+
     # Save sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
-        mag_x=payload.mag_x,
-        mag_y=payload.mag_y,
-        mag_z=payload.mag_z,
+        accel_x=payload.accel_x,
+        accel_y=payload.accel_y,
+        accel_z=payload.accel_z,
+        gyro_x=payload.gyro_x,
+        gyro_y=payload.gyro_y,
+        gyro_z=payload.gyro_z,
+        mag_x=mag_x,
+        mag_y=mag_y,
+        mag_z=mag_z,
         battery_percent=payload.battery_percent,
         seizure_flag=payload.seizure_flag
     ))
