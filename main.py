@@ -137,7 +137,6 @@ class DeviceRegister(BaseModel):
 class DeviceUpdate(BaseModel):
     label: str
 
-# ===== UPDATED PAYLOAD MODEL =====
 class UnifiedESP32Payload(BaseModel):
     device_id: str
     timestamp_ms: int
@@ -150,41 +149,18 @@ class UnifiedESP32Payload(BaseModel):
     gyro_y: float
     gyro_z: float
 
-# ===== CONVERSION FUNCTION =====
 def convert_accel_gyro_to_magnetometer(accel_x: float, accel_y: float, accel_z: float,
                                        gyro_x: float, gyro_y: float, gyro_z: float) -> tuple:
-    """
-    Convert accelerometer and gyroscope readings to simulated magnetometer values.
-    
-    Formula:
-    - magnitude_accel = sqrt(ax^2 + ay^2 + az^2)
-    - magnitude_gyro = sqrt(gx^2 + gy^2 + gz^2)
-    - mag_x = magnitude_accel + magnitude_gyro (combined magnitude)
-    - mag_y = accel magnitude (for reference)
-    - mag_z = gyro magnitude (for reference)
-    """
-    
-    # Calculate magnitude of acceleration (in g's after conversion)
     accel_mag = math.sqrt((accel_x/2048.0)**2 + (accel_y/2048.0)**2 + (accel_z/2048.0)**2) * 100
-    
-    # Calculate magnitude of gyroscope (in °/s after conversion)
     gyro_mag = math.sqrt((gyro_x/131.0)**2 + (gyro_y/131.0)**2 + (gyro_z/131.0)**2) * 10
-    
-    # Combined magnitude
     combined_mag = int(accel_mag + gyro_mag)
-    
-    # Store individual magnitudes for reference
     mag_x = combined_mag
     mag_y = int(accel_mag)
     mag_z = int(gyro_mag)
-    
     return mag_x, mag_y, mag_z
 
-# ============= SEIZURE DETECTION HELPER FUNCTIONS =============
-
 async def count_recent_seizure_readings(device_id: str, time_window_seconds: int = 5) -> int:
-    """Count consecutive seizure_flag=true readings in recent time window"""
-    cutoff_time = datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(seconds=time_window_seconds)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=time_window_seconds)
     rows = await database.fetch_all(
         sensor_data.select()
         .where(
@@ -197,7 +173,6 @@ async def count_recent_seizure_readings(device_id: str, time_window_seconds: int
     return len(rows)
 
 async def get_recent_seizure_data(device_ids: list, time_window_seconds: int = 5) -> dict:
-    """Get seizure flag status for all devices in recent time window"""
     device_seizure_counts = {}
     for device_id in device_ids:
         count = await count_recent_seizure_readings(device_id, time_window_seconds)
@@ -210,8 +185,6 @@ async def get_recent_seizure_data(device_ids: list, time_window_seconds: int = 5
         'devices_with_seizure': devices_with_seizure,
         'device_seizure_counts': device_seizure_counts
     }
-
-# ============= AUTH FUNCTIONS =============
 
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
@@ -310,8 +283,6 @@ async def log_device_status_changes():
             device_states[d["device_id"]] = connected
         await asyncio.sleep(1)
 
-# ============= PUBLIC ENDPOINTS =============
-
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
@@ -338,8 +309,6 @@ async def get_me(current_user=Depends(get_current_user)):
         "username": current_user["username"],
         "is_admin": current_user["is_admin"],
     }
-
-# ============= DEVICE ENDPOINTS =============
 
 @app.post("/api/devices/register")
 async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
@@ -470,8 +439,6 @@ async def get_device_history(device_id: str, current_user=Depends(get_current_us
         })
     return result
 
-# ============= SEIZURE EVENTS ENDPOINTS =============
-
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -564,8 +531,7 @@ async def download_seizure_history(current_user=Depends(get_current_user)):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-# ============= DATA UPLOAD ENDPOINT (WITH CONVERSION) =============
-
+# ============= CRITICAL FIX: UPLOAD ENDPOINT =============
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
     existing = await database.fetch_one(
@@ -577,9 +543,11 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
     ts_val = payload.timestamp_ms
     if ts_val > 1e12:
         ts_val = ts_val / 1000.0
-    ts_utc = datetime.utcfromtimestamp(ts_val).replace(tzinfo=timezone.utc)
+    
+    # ===== FIXED: Use proper timezone-aware datetime =====
+    ts_utc = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+    # =====================================================
 
-    # ===== CONVERT ACCEL/GYRO TO MAG =====
     mag_x, mag_y, mag_z = convert_accel_gyro_to_magnetometer(
         payload.accel_x,
         payload.accel_y,
@@ -589,7 +557,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         payload.gyro_z
     )
 
-    # Save sensor data with CONVERTED mag values
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
@@ -618,7 +585,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         })
     ))
 
-    # Device-level seizure tracking
     active_device = await get_active_device_seizure(payload.device_id)
     if payload.seizure_flag:
         if not active_device:
@@ -637,20 +603,17 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 .values(end_time=ts_utc)
             )
 
-    # User-level seizure detection (UNCHANGED)
     user_id = existing["user_id"]
     user_devices = await database.fetch_all(
         devices.select().where(devices.c.user_id == user_id)
     )
     device_ids = [d["device_id"] for d in user_devices]
 
-    # Get recent seizure data (last 5 seconds)
     seizure_data = await get_recent_seizure_data(device_ids, time_window_seconds=5)
     
     devices_with_seizure = seizure_data['devices_with_seizure']
     device_seizure_counts = seizure_data['device_seizure_counts']
 
-    # GTCS: 3+ devices with continuous seizure activity (2+ consecutive readings)
     if devices_with_seizure >= 3:
         continuous_seizure_devices = sum(
             1 for count in device_seizure_counts.values() if count >= 2
@@ -674,11 +637,8 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
             
             return {"status": "saved"}
 
-    # Jerk: 1-2 devices with seizure activity (isolated spikes)
-    # BUT ONLY if there's NO active GTCS
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
     if not active_gtcs and devices_with_seizure >= 1:
-        # Check if GTCS ended recently (within 30 seconds)
         recent_gtcs = await database.fetch_one(
             user_seizure_sessions.select()
             .where(user_seizure_sessions.c.user_id == user_id)
@@ -698,7 +658,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 )
                 return {"status": "saved"}
         
-        # Only create Jerk if GTCS didn't end recently
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if not active_jerk:
             await database.execute(user_seizure_sessions.insert().values(
@@ -710,7 +669,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
         
         return {"status": "saved"}
 
-    # No seizure activity: end any active sessions
     for stype in ["GTCS", "Jerk"]:
         session = await get_active_user_seizure(user_id, stype)
         if session:
@@ -719,8 +677,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
                 .values(end_time=ts_utc))
 
     return {"status": "saved"}
-
-# ============= ADMIN ENDPOINTS =============
 
 @app.get("/api/users")
 async def get_all_users(current_user=Depends(get_current_user)):
