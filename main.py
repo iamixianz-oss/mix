@@ -117,6 +117,12 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
+# =====================================================================
+# FIX 1: CONNECTED THRESHOLD - 30 seconds para hindi laging disconnect
+# Dati 10 seconds lang, pero 4 sensors x 5sec HTTP = 20sec na agad
+# =====================================================================
+CONNECTED_THRESHOLD_SECONDS = 30
+
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -158,6 +164,42 @@ def convert_accel_gyro_to_magnetometer(accel_x: float, accel_y: float, accel_z: 
     mag_y = int(accel_mag)
     mag_z = int(gyro_mag)
     return mag_x, mag_y, mag_z
+
+# =====================================================================
+# FIX 2: TIMESTAMP PARSING - Handle both seconds and milliseconds
+# Ang timestamp_ms mula sa ESP32 ay pwedeng seconds OR milliseconds
+# Depende sa NTP sync — kaya need nating i-handle ang dalawa
+# =====================================================================
+def parse_esp32_timestamp(timestamp_ms: int) -> datetime:
+    """
+    Safely parse ESP32 timestamp to timezone-aware UTC datetime.
+    
+    ESP32 sends: currentUnixTime * 1000UL (should be milliseconds)
+    But kung hindi na-sync ng NTP, maaaring millis() lang ang value (device uptime).
+    
+    Unix time in seconds (2020-2030) = 1,577,836,800 to 1,893,456,000
+    Unix time in milliseconds = 1,577,836,800,000 to 1,893,456,000,000
+    
+    So: if > 1e12, it's milliseconds. If 1e9 < x < 1e12, it's seconds.
+    If < 1e9, it's invalid (device uptime) — use server time instead.
+    """
+    ts_val = float(timestamp_ms)
+    
+    # Milliseconds → convert to seconds
+    if ts_val > 1e12:
+        ts_val = ts_val / 1000.0
+    
+    # Valid Unix timestamp range (year 2000 to 2100)
+    if 946684800 <= ts_val <= 4102444800:
+        # Valid timestamp — use it but ALWAYS store as UTC
+        ts_utc = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+    else:
+        # Invalid timestamp (NTP not synced, device uptime, etc.)
+        # Fall back to server time (already PHT-aware server)
+        print(f"[WARNING] Invalid timestamp from ESP32: {timestamp_ms} — using server time")
+        ts_utc = datetime.now(timezone.utc)
+    
+    return ts_utc
 
 async def count_recent_seizure_readings(device_id: str, time_window_seconds: int = 5) -> int:
     cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=time_window_seconds)
@@ -230,8 +272,17 @@ async def get_active_user_seizure(user_id: int, seizure_type: str):
         .where(user_seizure_sessions.c.end_time == None)
     )
 
+# =====================================================================
+# FIX 3: ts_pht_iso - Ensure always timezone-aware before converting
+# =====================================================================
 def ts_pht_iso(dt_utc: datetime) -> str:
-    dt_pht = to_pht(dt_utc)
+    """Convert UTC datetime to PHT ISO string. Always timezone-safe."""
+    if dt_utc is None:
+        return None
+    # Ensure timezone-aware
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    dt_pht = dt_utc.astimezone(PHT)
     return dt_pht.strftime("%Y-%m-%dT%H:%M:%S")
 
 app.add_middleware(
@@ -275,7 +326,8 @@ async def log_device_status_changes():
             if latest:
                 ts = to_pht(latest["timestamp"])
                 diff = (now - ts).total_seconds()
-                connected = diff <= 10
+                # FIX: Use 30s threshold instead of 10s
+                connected = diff <= CONNECTED_THRESHOLD_SECONDS
             last_state = device_states.get(d["device_id"])
             if last_state != connected:
                 status = "CONNECTED" if connected else "DISCONNECTED"
@@ -341,7 +393,8 @@ async def get_my_devices(current_user=Depends(get_current_user)):
             ts = to_pht(latest_data["timestamp"])
             now = datetime.now(PHT)
             diff = (now - ts).total_seconds()
-            last_sync_val = "Just now" if diff <= 10 else ts.isoformat()
+            # FIX: Use 30s threshold
+            last_sync_val = "Just now" if diff <= CONNECTED_THRESHOLD_SECONDS else ts.strftime("%I:%M %p")
         output.append({
             "device_id": r["device_id"],
             "label": r["label"],
@@ -350,6 +403,11 @@ async def get_my_devices(current_user=Depends(get_current_user)):
         })
     return output
 
+# =====================================================================
+# FIX 4: get_mydevices_with_latest_data
+# - Use CONNECTED_THRESHOLD_SECONDS (30s) instead of hardcoded 10s
+# - last_sync shows proper PHT time format
+# =====================================================================
 @app.get("/api/mydevices_with_latest_data")
 async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
     user_devices = await database.fetch_all(
@@ -367,8 +425,12 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
         if latest:
             ts_ph = to_pht(latest["timestamp"])
             diff = (now - ts_ph).total_seconds()
-            last_sync_val = "Just now" if diff <= 10 else ts_ph.strftime("%I:%M %p")
-            connected = diff <= 10
+            # FIX: Use 30s threshold for connected check
+            connected = diff <= CONNECTED_THRESHOLD_SECONDS
+            if diff <= 10:
+                last_sync_val = "Just now"
+            else:
+                last_sync_val = ts_ph.strftime("%I:%M %p")  # e.g. "09:07 AM" in PHT
         else:
             last_sync_val = None
             connected = False
@@ -531,7 +593,9 @@ async def download_seizure_history(current_user=Depends(get_current_user)):
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
-# ============= CRITICAL FIX: UPLOAD ENDPOINT =============
+# =====================================================================
+# FIX 5: UPLOAD ENDPOINT - Proper timestamp parsing + PHT logging
+# =====================================================================
 @app.post("/api/device/upload")
 async def upload_from_esp(payload: UnifiedESP32Payload):
     existing = await database.fetch_one(
@@ -540,13 +604,11 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
     if not existing:
         raise HTTPException(status_code=403, detail="Unknown device_id")
 
-    ts_val = payload.timestamp_ms
-    if ts_val > 1e12:
-        ts_val = ts_val / 1000.0
+    # FIX: Use the new safe timestamp parser
+    ts_utc = parse_esp32_timestamp(payload.timestamp_ms)
+    ts_pht_display = to_pht(ts_utc).strftime("%Y-%m-%d %H:%M:%S PHT")
     
-    # ===== FIXED: Use proper timezone-aware datetime =====
-    ts_utc = datetime.fromtimestamp(ts_val, tz=timezone.utc)
-    # =====================================================
+    print(f"[UPLOAD] device_id={payload.device_id} | raw_ts={payload.timestamp_ms} | parsed={ts_pht_display}")
 
     mag_x, mag_y, mag_z = convert_accel_gyro_to_magnetometer(
         payload.accel_x,
