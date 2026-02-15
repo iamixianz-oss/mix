@@ -701,6 +701,10 @@ async def delete_user(user_id: int, current_user=Depends(get_current_user)):
     await database.execute(delete_user_query)
     return {"detail": f"User {user['username']} deleted successfully"}
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"message": "Backend running - MPU6050 Sensor"}
