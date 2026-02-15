@@ -69,7 +69,7 @@ device_data = sqlalchemy.Table(
     sqlalchemy.Column("payload", sqlalchemy.Text),
 )
 
-# MPU6050 sensor data - accelerometer and gyroscope
+# MPU6050 sensor data - accelerometer (accel_x/y/z) and gyroscope (gyro_x/y/z)
 sensor_data = sqlalchemy.Table(
     "sensor_data",
     metadata,
