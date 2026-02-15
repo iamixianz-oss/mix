@@ -267,30 +267,23 @@ app.add_middleware(
 )
 
 @app.post("/api/register")
-async def register(user: UserCreate):
-    existing = await database.fetch_one(
-        users.select().where(users.c.username == user.username)
-    )
-    if existing:
-        raise HTTPException(status_code=400, detail="Username already exists")
-    await database.execute(
-        users.insert().values(
-            username=user.username,
-            password=user.password,
-            is_admin=user.is_admin
-        )
-    )
-    return {"message": "User created"}
+async def register(u: UserCreate):
+    if await get_user_by_username(u.username):
+        raise HTTPException(status_code=400, detail="Username exists")
+    query = users.insert().values(username=u.username, password=u.password, is_admin=u.is_admin)
+    user_id = await database.execute(query)
+    return {"id": user_id, "username": u.username}
 
 @app.post("/api/login", response_model=Token)
-async def login(req: LoginRequest):
-    row = await database.fetch_one(
-        users.select().where(users.c.username == req.username)
+async def login(body: LoginRequest):
+    user = await authenticate_user(body.username, body.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid login")
+    token = create_access_token(
+        {"sub": user["username"], "is_admin": user["is_admin"]},
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
-    if not row or row["password"] != req.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_access_token({"user_id": row["id"]})
-    return Token(access_token=token, token_type="bearer")
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/api/me")
 async def get_me(current_user=Depends(get_current_user)):
@@ -300,21 +293,17 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-@app.post("/api/devices")
-async def register_device(device: DeviceRegister, current_user=Depends(get_current_user)):
-    existing = await database.fetch_one(
-        devices.select().where(devices.c.device_id == device.device_id)
-    )
-    if existing:
-        raise HTTPException(status_code=400, detail="Device already registered")
+@app.post("/api/devices/register")
+async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
+    my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
+    if len(my_devices) >= 3:
+        raise HTTPException(status_code=400, detail="Max 3 devices allowed")
+    if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
+        raise HTTPException(status_code=400, detail="Device ID exists")
     await database.execute(
-        devices.insert().values(
-            user_id=current_user["id"],
-            device_id=device.device_id,
-            label=device.label or device.device_id,
-        )
+        devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
     )
-    return {"message": "Device registered"}
+    return {"status": "ok", "device_id": d.device_id}
 
 @app.get("/api/devices")
 async def get_user_devices(current_user=Depends(get_current_user)):
