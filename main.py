@@ -40,7 +40,7 @@ engine = sqlalchemy.create_engine(
     else {}
 )
 
-app = FastAPI(title="Seizure Monitor Backend")
+app = FastAPI(title="Seizure Monitor Backend - MPU6050")
 
 users = sqlalchemy.Table(
     "users",
@@ -69,15 +69,21 @@ device_data = sqlalchemy.Table(
     sqlalchemy.Column("payload", sqlalchemy.Text),
 )
 
+# MPU6050 sensor data - accelerometer and gyroscope only
 sensor_data = sqlalchemy.Table(
     "sensor_data",
     metadata,
     sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
     sqlalchemy.Column("device_id", sqlalchemy.String, index=True),
     sqlalchemy.Column("timestamp", sqlalchemy.DateTime(timezone=True)),
-    sqlalchemy.Column("mag_x", sqlalchemy.Integer),
-    sqlalchemy.Column("mag_y", sqlalchemy.Integer),
-    sqlalchemy.Column("mag_z", sqlalchemy.Integer),
+    # Accelerometer values (MPU6050)
+    sqlalchemy.Column("accel_x", sqlalchemy.Float),
+    sqlalchemy.Column("accel_y", sqlalchemy.Float),
+    sqlalchemy.Column("accel_z", sqlalchemy.Float),
+    # Gyroscope values (MPU6050)
+    sqlalchemy.Column("gyro_x", sqlalchemy.Float),
+    sqlalchemy.Column("gyro_y", sqlalchemy.Float),
+    sqlalchemy.Column("gyro_z", sqlalchemy.Float),
     sqlalchemy.Column("battery_percent", sqlalchemy.Integer),
     sqlalchemy.Column("seizure_flag", sqlalchemy.Boolean, default=False),
 )
@@ -117,10 +123,6 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-# =====================================================================
-# FIX 1: CONNECTED THRESHOLD - 30 seconds para hindi laging disconnect
-# Dati 10 seconds lang, pero 4 sensors x 5sec HTTP = 20sec na agad
-# =====================================================================
 CONNECTED_THRESHOLD_SECONDS = 30
 
 class UserCreate(BaseModel):
@@ -155,33 +157,9 @@ class UnifiedESP32Payload(BaseModel):
     gyro_y: float
     gyro_z: float
 
-def convert_accel_gyro_to_magnetometer(accel_x: float, accel_y: float, accel_z: float,
-                                       gyro_x: float, gyro_y: float, gyro_z: float) -> tuple:
-    accel_mag = math.sqrt((accel_x/2048.0)**2 + (accel_y/2048.0)**2 + (accel_z/2048.0)**2) * 100
-    gyro_mag = math.sqrt((gyro_x/131.0)**2 + (gyro_y/131.0)**2 + (gyro_z/131.0)**2) * 10
-    combined_mag = int(accel_mag + gyro_mag)
-    mag_x = combined_mag
-    mag_y = int(accel_mag)
-    mag_z = int(gyro_mag)
-    return mag_x, mag_y, mag_z
-
-# =====================================================================
-# FIX 2: TIMESTAMP PARSING - Handle both seconds and milliseconds
-# Ang timestamp_ms mula sa ESP32 ay pwedeng seconds OR milliseconds
-# Depende sa NTP sync — kaya need nating i-handle ang dalawa
-# =====================================================================
 def parse_esp32_timestamp(timestamp_ms: int) -> datetime:
     """
     Safely parse ESP32 timestamp to timezone-aware UTC datetime.
-    
-    ESP32 sends: currentUnixTime * 1000UL (should be milliseconds)
-    But kung hindi na-sync ng NTP, maaaring millis() lang ang value (device uptime).
-    
-    Unix time in seconds (2020-2030) = 1,577,836,800 to 1,893,456,000
-    Unix time in milliseconds = 1,577,836,800,000 to 1,893,456,000,000
-    
-    So: if > 1e12, it's milliseconds. If 1e9 < x < 1e12, it's seconds.
-    If < 1e9, it's invalid (device uptime) — use server time instead.
     """
     ts_val = float(timestamp_ms)
     
@@ -191,11 +169,8 @@ def parse_esp32_timestamp(timestamp_ms: int) -> datetime:
     
     # Valid Unix timestamp range (year 2000 to 2100)
     if 946684800 <= ts_val <= 4102444800:
-        # Valid timestamp — use it but ALWAYS store as UTC
         ts_utc = datetime.fromtimestamp(ts_val, tz=timezone.utc)
     else:
-        # Invalid timestamp (NTP not synced, device uptime, etc.)
-        # Fall back to server time (already PHT-aware server)
         print(f"[WARNING] Invalid timestamp from ESP32: {timestamp_ms} — using server time")
         ts_utc = datetime.now(timezone.utc)
     
@@ -207,83 +182,81 @@ async def count_recent_seizure_readings(device_id: str, time_window_seconds: int
         sensor_data.select()
         .where(
             (sensor_data.c.device_id == device_id) &
-            (sensor_data.c.seizure_flag == True) &
-            (sensor_data.c.timestamp >= cutoff_time)
+            (sensor_data.c.timestamp >= cutoff_time) &
+            (sensor_data.c.seizure_flag == True)
         )
-        .order_by(sensor_data.c.timestamp.desc())
     )
     return len(rows)
 
-async def get_recent_seizure_data(device_ids: list, time_window_seconds: int = 5) -> dict:
+async def get_recent_seizure_data(device_ids: list, time_window_seconds: int = 5):
+    cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=time_window_seconds)
+    
+    devices_with_seizure = 0
     device_seizure_counts = {}
+    
     for device_id in device_ids:
         count = await count_recent_seizure_readings(device_id, time_window_seconds)
         device_seizure_counts[device_id] = count
-    
-    devices_with_seizure = sum(1 for count in device_seizure_counts.values() if count > 0)
+        if count > 0:
+            devices_with_seizure += 1
     
     return {
-        'total_devices': len(device_ids),
         'devices_with_seizure': devices_with_seizure,
         'device_seizure_counts': device_seizure_counts
     }
 
-async def get_user_by_username(username: str):
-    return await database.fetch_one(users.select().where(users.c.username == username))
-
-async def authenticate_user(username: str, password: str):
-    user = await get_user_by_username(username)
-    if not user or user["password"] != password:
-        return False
-    return user
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.now(PHT) + (expires_delta or timedelta(minutes=15))
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    exc = HTTPException(status_code=401, detail="Invalid or expired token")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise exc
+        user_id: int = payload.get("user_id")
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        row = await database.fetch_one(users.select().where(users.c.id == user_id))
+        if row is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        return dict(row)
     except JWTError:
-        raise exc
-    user = await get_user_by_username(username)
-    if not user:
-        raise exc
-    return user
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def ts_pht_iso(ts_utc: Optional[datetime]) -> Optional[str]:
+    if ts_utc is None:
+        return None
+    dt_pht = to_pht(ts_utc)
+    return dt_pht.isoformat()
 
 async def get_active_device_seizure(device_id: str):
-    return await database.fetch_one(
+    row = await database.fetch_one(
         device_seizure_sessions.select()
         .where(device_seizure_sessions.c.device_id == device_id)
         .where(device_seizure_sessions.c.end_time == None)
+        .order_by(device_seizure_sessions.c.start_time.desc())
     )
+    return row
 
 async def get_active_user_seizure(user_id: int, seizure_type: str):
-    return await database.fetch_one(
+    row = await database.fetch_one(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == user_id)
         .where(user_seizure_sessions.c.type == seizure_type)
         .where(user_seizure_sessions.c.end_time == None)
+        .order_by(user_seizure_sessions.c.start_time.desc())
     )
+    return row
 
-# =====================================================================
-# FIX 3: ts_pht_iso - Ensure always timezone-aware before converting
-# =====================================================================
-def ts_pht_iso(dt_utc: datetime) -> str:
-    """Convert UTC datetime to PHT ISO string. Always timezone-safe."""
-    if dt_utc is None:
-        return None
-    # Ensure timezone-aware
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    dt_pht = dt_utc.astimezone(PHT)
-    return dt_pht.strftime("%Y-%m-%dT%H:%M:%S")
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
 app.add_middleware(
     CORSMiddleware,
@@ -293,66 +266,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-    metadata.create_all(engine)
-    asyncio.create_task(log_device_status_changes())
-
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
-
-@app.get("/api/health")
-async def health_check():
-    return {"status": "ok", "db": DATABASE_URL}
-
-device_states = {}
-
-async def log_device_status_changes():
-    while True:
-        now = datetime.now(PHT)
-        all_devices = await database.fetch_all(devices.select())
-        for d in all_devices:
-            user_row = await database.fetch_one(users.select().where(users.c.id == d["user_id"]))
-            username = user_row["username"] if user_row else "Unknown"
-            latest = await database.fetch_one(
-                sensor_data.select()
-                .where(sensor_data.c.device_id == d["device_id"])
-                .order_by(sensor_data.c.timestamp.desc())
-                .limit(1)
-            )
-            connected = False
-            if latest:
-                ts = to_pht(latest["timestamp"])
-                diff = (now - ts).total_seconds()
-                # FIX: Use 30s threshold instead of 10s
-                connected = diff <= CONNECTED_THRESHOLD_SECONDS
-            last_state = device_states.get(d["device_id"])
-            if last_state != connected:
-                status = "CONNECTED" if connected else "DISCONNECTED"
-                print(f"[{now.isoformat()}] Device {d['device_id']} (Owner: {username}) is {status}")
-            device_states[d["device_id"]] = connected
-        await asyncio.sleep(1)
-
 @app.post("/api/register")
-async def register(u: UserCreate):
-    if await get_user_by_username(u.username):
-        raise HTTPException(status_code=400, detail="Username exists")
-    query = users.insert().values(username=u.username, password=u.password, is_admin=u.is_admin)
-    user_id = await database.execute(query)
-    return {"id": user_id, "username": u.username}
+async def register(user: UserCreate):
+    existing = await database.fetch_one(
+        users.select().where(users.c.username == user.username)
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    await database.execute(
+        users.insert().values(
+            username=user.username,
+            password=user.password,
+            is_admin=user.is_admin
+        )
+    )
+    return {"message": "User created"}
 
 @app.post("/api/login", response_model=Token)
-async def login(body: LoginRequest):
-    user = await authenticate_user(body.username, body.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid login")
-    token = create_access_token(
-        {"sub": user["username"], "is_admin": user["is_admin"]},
-        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+async def login(req: LoginRequest):
+    row = await database.fetch_one(
+        users.select().where(users.c.username == req.username)
     )
-    return {"access_token": token, "token_type": "bearer"}
+    if not row or row["password"] != req.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token({"user_id": row["id"]})
+    return Token(access_token=token, token_type="bearer")
 
 @app.get("/api/me")
 async def get_me(current_user=Depends(get_current_user)):
@@ -362,144 +300,135 @@ async def get_me(current_user=Depends(get_current_user)):
         "is_admin": current_user["is_admin"],
     }
 
-@app.post("/api/devices/register")
-async def register_device(d: DeviceRegister, current_user=Depends(get_current_user)):
-    my_devices = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
-    if len(my_devices) >= 4:
-        raise HTTPException(status_code=400, detail="Max 4 devices allowed")
-    if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
-        raise HTTPException(status_code=400, detail="Device ID exists")
-    await database.execute(
-        devices.insert().values(user_id=current_user["id"], device_id=d.device_id, label=d.label or d.device_id)
+@app.post("/api/devices")
+async def register_device(device: DeviceRegister, current_user=Depends(get_current_user)):
+    existing = await database.fetch_one(
+        devices.select().where(devices.c.device_id == device.device_id)
     )
-    return {"status": "ok", "device_id": d.device_id}
-
-@app.get("/api/mydevices")
-async def get_my_devices(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(devices.select().where(devices.c.user_id == current_user["id"]))
-    output = []
-    for r in rows:
-        latest_data = await database.fetch_one(
-            device_data.select()
-            .where(device_data.c.device_id == r["device_id"])
-            .order_by(device_data.c.timestamp.desc())
-            .limit(1)
+    if existing:
+        raise HTTPException(status_code=400, detail="Device already registered")
+    await database.execute(
+        devices.insert().values(
+            user_id=current_user["id"],
+            device_id=device.device_id,
+            label=device.label or device.device_id,
         )
-        battery = 100
-        last_sync_val = None
-        if latest_data:
-            payload = json.loads(latest_data["payload"])
-            battery = payload.get("battery_percent", 100)
-            ts = to_pht(latest_data["timestamp"])
-            now = datetime.now(PHT)
-            diff = (now - ts).total_seconds()
-            # FIX: Use 30s threshold
-            last_sync_val = "Just now" if diff <= CONNECTED_THRESHOLD_SECONDS else ts.strftime("%I:%M %p")
-        output.append({
-            "device_id": r["device_id"],
-            "label": r["label"],
-            "battery_percent": battery,
-            "last_sync": last_sync_val
-        })
-    return output
+    )
+    return {"message": "Device registered"}
 
-# =====================================================================
-# FIX 4: get_mydevices_with_latest_data
-# - Use CONNECTED_THRESHOLD_SECONDS (30s) instead of hardcoded 10s
-# - last_sync shows proper PHT time format
-# =====================================================================
-@app.get("/api/mydevices_with_latest_data")
-async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
-    user_devices = await database.fetch_all(
+@app.get("/api/devices")
+async def get_user_devices(current_user=Depends(get_current_user)):
+    rows = await database.fetch_all(
         devices.select().where(devices.c.user_id == current_user["id"])
     )
-    output = []
-    now = datetime.now(PHT)
-    for d in user_devices:
+    result = []
+    cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=CONNECTED_THRESHOLD_SECONDS)
+    
+    for row in rows:
         latest = await database.fetch_one(
             sensor_data.select()
-            .where(sensor_data.c.device_id == d["device_id"])
+            .where(sensor_data.c.device_id == row["device_id"])
             .order_by(sensor_data.c.timestamp.desc())
             .limit(1)
         )
+        
+        connected = False
+        battery = 0
+        last_sync_display = None
+        accel_x = 0.0
+        accel_y = 0.0
+        accel_z = 0.0
+        gyro_x = 0.0
+        gyro_y = 0.0
+        gyro_z = 0.0
+        seizure_flag = False
+        
         if latest:
-            ts_ph = to_pht(latest["timestamp"])
-            diff = (now - ts_ph).total_seconds()
-            # FIX: Use 30s threshold for connected check
-            connected = diff <= CONNECTED_THRESHOLD_SECONDS
-            if diff <= 10:
-                last_sync_val = "Just now"
-            else:
-                last_sync_val = ts_ph.strftime("%I:%M %p")  # e.g. "09:07 AM" in PHT
-        else:
-            last_sync_val = None
-            connected = False
-        output.append({
-            "device_id": d["device_id"],
-            "label": d["label"],
-            "battery_percent": latest["battery_percent"] if latest else 100,
-            "last_sync": last_sync_val,
-            "mag_x": latest["mag_x"] if latest else 0,
-            "mag_y": latest["mag_y"] if latest else 0,
-            "mag_z": latest["mag_z"] if latest else 0,
-            "seizure_flag": latest["seizure_flag"] if latest else False,
-            "connected": connected
+            connected = latest["timestamp"] >= cutoff_time
+            battery = latest["battery_percent"]
+            dt_pht = to_pht(latest["timestamp"])
+            last_sync_display = dt_pht.strftime("%I:%M %p")
+            accel_x = latest["accel_x"] or 0.0
+            accel_y = latest["accel_y"] or 0.0
+            accel_z = latest["accel_z"] or 0.0
+            gyro_x = latest["gyro_x"] or 0.0
+            gyro_y = latest["gyro_y"] or 0.0
+            gyro_z = latest["gyro_z"] or 0.0
+            seizure_flag = latest["seizure_flag"] or False
+        
+        result.append({
+            "id": row["id"],
+            "device_id": row["device_id"],
+            "label": row["label"],
+            "connected": connected,
+            "battery_percent": battery,
+            "last_sync_display": last_sync_display,
+            "accel_x": accel_x,
+            "accel_y": accel_y,
+            "accel_z": accel_z,
+            "gyro_x": gyro_x,
+            "gyro_y": gyro_y,
+            "gyro_z": gyro_z,
+            "seizure_flag": seizure_flag,
         })
-    return output
+    
+    return result
 
 @app.put("/api/devices/{device_id}")
-async def update_device(device_id: str, body: DeviceUpdate, current_user=Depends(get_current_user)):
+async def update_device(device_id: str, update: DeviceUpdate, current_user=Depends(get_current_user)):
     row = await database.fetch_one(
-        devices.select().where(
-            (devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"])
-        )
+        devices.select()
+        .where(devices.c.device_id == device_id)
+        .where(devices.c.user_id == current_user["id"])
     )
     if not row:
         raise HTTPException(status_code=404, detail="Device not found")
-    await database.execute(devices.update().where(devices.c.id == row["id"]).values(label=body.label))
-    return {"status": "updated", "device_id": device_id, "label": body.label}
+    await database.execute(
+        devices.update()
+        .where(devices.c.device_id == device_id)
+        .values(label=update.label)
+    )
+    return {"message": "Device updated"}
 
 @app.delete("/api/devices/{device_id}")
 async def delete_device(device_id: str, current_user=Depends(get_current_user)):
     row = await database.fetch_one(
-        devices.select().where(
-            (devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"])
-        )
+        devices.select()
+        .where(devices.c.device_id == device_id)
+        .where(devices.c.user_id == current_user["id"])
     )
     if not row:
         raise HTTPException(status_code=404, detail="Device not found")
-    await database.execute(devices.delete().where(devices.c.id == row["id"]))
-    return {"status": "deleted", "device_id": device_id}
+    await database.execute(
+        devices.delete().where(devices.c.device_id == device_id)
+    )
+    return {"message": "Device deleted"}
 
-@app.get("/api/devices/{device_id}", response_model=List[dict])
-async def get_device_history(device_id: str, current_user=Depends(get_current_user)):
-    r = await database.fetch_one(
-        devices.select().where(
-            (devices.c.device_id == device_id) & (devices.c.user_id == current_user["id"])
-        )
+@app.get("/api/latest_seizure_event")
+async def get_latest_seizure_event(current_user=Depends(get_current_user)):
+    user_devices = await database.fetch_all(
+        devices.select().where(devices.c.user_id == current_user["id"])
     )
-    if not r:
-        raise HTTPException(status_code=403, detail="Not your device")
-    rows = await database.fetch_all(
-        device_data.select()
-        .where(device_data.c.device_id == device_id)
-        .order_by(device_data.c.timestamp.desc())
-        .limit(1000)
+    device_ids = [d["device_id"] for d in user_devices]
+    
+    if not device_ids:
+        return None
+    
+    row = await database.fetch_one(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == current_user["id"])
+        .order_by(user_seizure_sessions.c.start_time.desc())
+        .limit(1)
     )
-    result = []
-    for row in rows:
-        payload = json.loads(row["payload"])
-        result.append({
-            "id": row["id"],
-            "device_id": row["device_id"],
-            "timestamp": ts_pht_iso(row["timestamp"]),
-            "mag_x": payload.get("mag_x"),
-            "mag_y": payload.get("mag_y"),
-            "mag_z": payload.get("mag_z"),
-            "battery_percent": payload.get("battery_percent", 100),
-            "seizure_flag": payload.get("seizure_flag", False)
-        })
-    return result
+    
+    if not row:
+        return None
+    
+    return {
+        "type": row["type"],
+        "start_time": ts_pht_iso(row["start_time"]),
+        "end_time": ts_pht_iso(row["end_time"]),
+    }
 
 @app.get("/api/seizure_events")
 async def get_seizure_events(current_user=Depends(get_current_user)):
@@ -508,123 +437,67 @@ async def get_seizure_events(current_user=Depends(get_current_user)):
         .where(user_seizure_sessions.c.user_id == current_user["id"])
         .order_by(user_seizure_sessions.c.start_time.desc())
     )
+    
     result = []
     for r in rows:
         result.append({
             "type": r["type"],
             "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
+            "end": ts_pht_iso(r["end_time"]),
         })
-    return result
-
-@app.get("/api/seizure_events/latest")
-async def get_latest_event(current_user=Depends(get_current_user)):
-    active_rows = await database.fetch_all(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.user_id == current_user["id"])
-        .where(user_seizure_sessions.c.end_time == None)
-        .order_by(user_seizure_sessions.c.start_time.desc())
-        .limit(1)
-    )
-    if active_rows:
-        r = active_rows[0]
-    else:
-        latest_rows = await database.fetch_all(
-            user_seizure_sessions.select()
-            .where(user_seizure_sessions.c.user_id == current_user["id"])
-            .order_by(user_seizure_sessions.c.start_time.desc())
-            .limit(1)
-        )
-        if latest_rows:
-            r = latest_rows[0]
-        else:
-            return {}
-    return {
-        "type": r["type"],
-        "start": ts_pht_iso(r["start_time"]),
-        "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
-    }
-
-@app.get("/api/seizure_events/all")
-async def get_all_seizure_events(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.user_id == current_user["id"])
-        .order_by(user_seizure_sessions.c.start_time.desc())
-    )
-    result = []
-    for r in rows:
-        result.append({
-            "type": r["type"],
-            "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None
-        })
+    
     return result
 
 @app.get("/api/seizure_events/download")
-async def download_seizure_history(current_user=Depends(get_current_user)):
+async def download_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
         user_seizure_sessions.select()
         .where(user_seizure_sessions.c.user_id == current_user["id"])
         .order_by(user_seizure_sessions.c.start_time.desc())
     )
     
-    def generate_csv():
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["Type", "Start Time (PHT)", "End Time (PHT)", "Duration (seconds)"])
-        for r in rows:
-            start = to_pht(r["start_time"])
-            end = to_pht(r["end_time"]) if r["end_time"] else None
-            duration = int((end - start).total_seconds()) if end else ""
-            writer.writerow([
-                r["type"],
-                start.strftime("%Y-%m-%d %H:%M:%S"),
-                end.strftime("%Y-%m-%d %H:%M:%S") if end else "Ongoing",
-                duration
-            ])
-        output.seek(0)
-        return output
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Type", "Start Time", "End Time", "Duration (seconds)"])
     
-    filename = f"seizure_history_{datetime.now(PHT).strftime('%Y%m%d_%H%M%S')}.csv"
+    for r in rows:
+        start = ts_pht_iso(r["start_time"])
+        end = ts_pht_iso(r["end_time"]) if r["end_time"] else "Ongoing"
+        
+        duration = ""
+        if r["end_time"]:
+            delta = r["end_time"] - r["start_time"]
+            duration = str(delta.total_seconds())
+        
+        writer.writerow([r["type"], start, end, duration])
+    
+    output.seek(0)
     return StreamingResponse(
-        generate_csv(),
+        iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": "attachment; filename=seizure_events.csv"}
     )
 
-# =====================================================================
-# FIX 5: UPLOAD ENDPOINT - Proper timestamp parsing + PHT logging
-# =====================================================================
 @app.post("/api/device/upload")
-async def upload_from_esp(payload: UnifiedESP32Payload):
+async def upload_device_data(payload: UnifiedESP32Payload):
     existing = await database.fetch_one(
         devices.select().where(devices.c.device_id == payload.device_id)
     )
     if not existing:
-        raise HTTPException(status_code=403, detail="Unknown device_id")
+        raise HTTPException(status_code=404, detail=f"Device {payload.device_id} not registered")
 
-    # FIX: Use the new safe timestamp parser
     ts_utc = parse_esp32_timestamp(payload.timestamp_ms)
-    ts_pht_display = to_pht(ts_utc).strftime("%Y-%m-%d %H:%M:%S PHT")
-    
-    print(f"[UPLOAD] device_id={payload.device_id} | raw_ts={payload.timestamp_ms} | parsed={ts_pht_display}")
 
-    mag_x, mag_y, mag_z = convert_accel_gyro_to_magnetometer(
-        payload.accel_x,
-        payload.accel_y,
-        payload.accel_z,
-        payload.gyro_x,
-        payload.gyro_y,
-        payload.gyro_z
-    )
-
+    # Store MPU6050 sensor data directly
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
-        mag_x=mag_x,
-        mag_y=mag_y,
-        mag_z=mag_z,
+        accel_x=payload.accel_x,
+        accel_y=payload.accel_y,
+        accel_z=payload.accel_z,
+        gyro_x=payload.gyro_x,
+        gyro_y=payload.gyro_y,
+        gyro_z=payload.gyro_z,
         battery_percent=payload.battery_percent,
         seizure_flag=payload.seizure_flag
     ))
@@ -641,9 +514,6 @@ async def upload_from_esp(payload: UnifiedESP32Payload):
             "gyro_z": payload.gyro_z,
             "battery_percent": payload.battery_percent,
             "seizure_flag": payload.seizure_flag,
-            "mag_x": mag_x,
-            "mag_y": mag_y,
-            "mag_z": mag_z
         })
     ))
 
@@ -807,9 +677,12 @@ async def get_event_sensor_data(user_id: int, start: str, end: Optional[str] = N
     for r in rows:
         result.append({
             "timestamp": ts_pht_iso(r["timestamp"]),
-            "mag_x": r["mag_x"],
-            "mag_y": r["mag_y"],
-            "mag_z": r["mag_z"],
+            "accel_x": r["accel_x"],
+            "accel_y": r["accel_y"],
+            "accel_z": r["accel_z"],
+            "gyro_x": r["gyro_x"],
+            "gyro_y": r["gyro_y"],
+            "gyro_z": r["gyro_z"],
             "battery_percent": r["battery_percent"],
             "seizure_flag": r["seizure_flag"],
         })
@@ -830,7 +703,7 @@ async def delete_user(user_id: int, current_user=Depends(get_current_user)):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running"}
+    return {"message": "Backend running - MPU6050 Sensor"}
 
 if __name__ == "__main__":
     import uvicorn
