@@ -575,8 +575,11 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     )
     device_ids = [d["device_id"] for d in user_devices]
 
-    # Count how many devices have seizure readings in the past 4 seconds
-    seizure_data = await get_recent_seizure_data(device_ids, time_window_seconds=4)
+    # FIX 4: Increased from 4s to 8s — covers 2 full sync cycles per device
+    # At SYNC_INTERVAL_MS=2000, a device sends every 2s.
+    # With 4s window, timing mismatches could miss devices → always Jerk
+    # With 8s window, all active devices are captured reliably → correct GTCS
+    seizure_data = await get_recent_seizure_data(device_ids, time_window_seconds=8)
     devices_with_seizure = seizure_data['devices_with_seizure']
     device_seizure_counts = seizure_data['device_seizure_counts']
 
@@ -585,8 +588,11 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     # ------------------------------------------------------------------
     # CASE 1: GTCS - 2+ devices with seizure AND 2+ are continuous
     # ------------------------------------------------------------------
+    # FIX 5: continuous threshold lowered from >= 2 to >= 1 per device
+    # BEFORE: required 2+ seizure readings per device → GTCS rarely triggered
+    # AFTER:  1+ seizure reading per device in 8s window → correct GTCS
     if devices_with_seizure >= 2:
-        continuous = sum(1 for c in device_seizure_counts.values() if c >= 2)
+        continuous = sum(1 for c in device_seizure_counts.values() if c >= 1)
         if continuous >= 2:
             active_gtcs = await get_active_user_seizure(user_id, "GTCS")
             if not active_gtcs:
