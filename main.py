@@ -250,30 +250,21 @@ async def get_active_user_seizure(user_id: int, seizure_type: str):
     )
 
 async def count_recent_seizure_readings(device_id: str, anchor_time: datetime, time_window_seconds: int = 5) -> int:
-    # anchor_time = ESP32 timestamp ng current upload
-    # Window = anchor ± 5s → catches all sensors that fired in the same event
-    # (All sensors detect within ~0.4s of each other, so 5s is more than enough)
+    # Check if this device currently has an ACTIVE (open) seizure session.
+    # "Active" means device_seizure_sessions row with end_time=None for this device.
     #
-    # WHY NOT datetime.now():
-    # Render free tier delivers uploads 5-11s apart even for same-event data.
-    # Using server time as anchor means late-arriving devices miss earlier ones.
-    # Using ESP32 timestamp as anchor is stable — all devices share the same clock.
+    # WHY NOT a time window query on sensor_data:
+    # The old approach queried sensor_data for seizure_flag=True within ±5s of anchor.
+    # Problem: even after a device stops seizing and sends seizure_flag=False,
+    # the OLD seizure_flag=True rows are still in the DB and still fall inside
+    # the ±5s window → devices_with_seizure stays > 0 → session never closes.
     #
-    # WHY NOT 30s:
-    # Too wide — would catch readings from the PREVIOUS seizure event.
-    # 5s is tight enough to be event-specific but wide enough to handle
-    # the ~0.4s detection window difference between sensors.
-    cutoff_time = anchor_time - timedelta(seconds=time_window_seconds)
-    upper_time  = anchor_time + timedelta(seconds=time_window_seconds)
-    rows = await database.fetch_all(
-        sensor_data.select().where(
-            (sensor_data.c.device_id == device_id) &
-            (sensor_data.c.timestamp >= cutoff_time) &
-            (sensor_data.c.timestamp <= upper_time) &
-            (sensor_data.c.seizure_flag == True)
-        )
-    )
-    return len(rows)
+    # The device_seizure_sessions table is the source of truth:
+    # - When device sends seizure_flag=True  → a session row is opened (end_time=None)
+    # - When device sends seizure_flag=False → that session row is closed (end_time=now)
+    # So checking for an open session is exactly "is this device currently seizing?"
+    active = await get_active_device_seizure(device_id)
+    return 1 if active else 0
 
 async def get_recent_seizure_data(device_ids: list, anchor_time: datetime, time_window_seconds: int = 5):
     devices_with_seizure = 0
@@ -719,8 +710,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 .values(end_time=now_utc)
             )
 
-    # FIX BUG 2: pass ts_utc as anchor so window is relative to ESP32 event time
-    # not server arrival time (which varies by 5-15s on Render free tier)
+    # Now check how many devices currently have an ACTIVE open seizure session.
+    # This is checked AFTER the device session above is opened/closed,
+    # so the current device's state is already reflected in the DB.
+    # anchor_time param kept for backward compat but no longer used for window queries.
     seizure_data = await get_recent_seizure_data(device_ids, anchor_time=ts_utc, time_window_seconds=5)
     devices_with_seizure = seizure_data['devices_with_seizure']
     device_seizure_counts = seizure_data['device_seizure_counts']
