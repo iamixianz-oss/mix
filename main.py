@@ -264,7 +264,7 @@ async def log_device_status_changes():
             if latest:
                 ts = to_pht(latest["timestamp"])
                 diff = (now - ts).total_seconds()
-                connected = diff <= 10
+                connected = diff <= 30  # raised from 10 — upload interval is 2s, 10s was too tight
             last_state = device_states.get(d["device_id"])
             if last_state != connected:
                 status = "CONNECTED" if connected else "DISCONNECTED"
@@ -361,7 +361,7 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             ts_ph = to_pht(latest["timestamp"])
             diff = (now - ts_ph).total_seconds()
             last_sync_val = "Just now" if diff <= 10 else ts_ph.strftime("%I:%M %p")
-            connected = diff <= 10
+            connected = diff <= 30  # raised from 10 — consistent with CONNECTED_THRESHOLD_SECONDS
         else:
             last_sync_val = None
             connected = False
