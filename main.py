@@ -1,37 +1,35 @@
 # =====================================================================
-# SEIZURE MONITOR BACKEND - v5 DURATION-BASED ESCALATION
+# SEIZURE MONITOR BACKEND — v6 IMPROVED
 #
-# PREVIOUS FIXES (v1):
-# 1. Jerk session not immediately closed by non-seizure device
-# 2. MIN_JERK/GTCS_DURATION guards
-# 3. devices_with_seizure == 0 check separation
-# 4. time_window_seconds raised to 8
-# 5. GTCS continuous threshold lowered to >= 1
+# WHAT CHANGED FROM v5:
 #
-# DISCONNECT / RECONNECT BUGS (v2):
-# [FIX A] CONNECTED_THRESHOLD_SECONDS raised 30 → 60
-# [FIX B] Stale open sessions auto-closed on reconnect
-# [FIX C] per-device last_seen index added to sensor_data query
-# [FIX D] Unclosed stale user_seizure_sessions on startup
+# [FIX H] EXTENDED PAYLOAD MODEL
+#   - Added: accel_peak_g (float) — peak dynamic accel in BLE window
+#   - Added: jerk_peak_gps (float) — peak jerk (g/s) from wearable
+#   - Added: gtcs_flag (bool) — base station's GTCS determination
+#   - Added: jerk_flag_raw (bool) — base station's Jerk determination
+#   - These allow the backend to do a secondary confidence check
+#     on top of the base station's decision
 #
-# SESSION MANAGEMENT (v3):
-# [FIX E] Session-based detection instead of time window
+# [FIX I] DUAL-FLAG CLASSIFICATION
+#   - Base station now sends both gtcs_flag and jerk_flag_raw
+#   - Backend uses BOTH seizure_flag AND these specific flags
+#     to decide session type with higher confidence
+#   - Rule:
+#     seizure_flag=True + gtcs_flag=True  → open/maintain GTCS session
+#     seizure_flag=True + jerk_flag=True  → open/maintain Jerk session
+#     seizure_flag=True (neither flag)    → treat as Jerk (conservative)
+#     seizure_flag=False                  → close open sessions
 #
-# SD CARD OFFLINE BUFFERING (v4):
-# [FIX F] ESP32 timestamp (ts_utc) for all session times
+# [FIX J] SENSOR_DATA TABLE EXTENDED
+#   - Added columns: accel_peak_g, jerk_peak_gps
+#   - These are stored for future ML model training
 #
-# DURATION-BASED ESCALATION (v5):
-# [FIX G] Jerk sessions lasting >= MIN_GTCS_DURATION_SECONDS
-#         are automatically reclassified as GTCS on close.
-#         Reasoning:
-#           - A true myoclonic jerk lasts 1-2 seconds max
-#           - If 1 device seizes for 5+ seconds = prolonged event
-#           - Prolonged single-device seizure = GTCS-level severity
-#           - This also fixes the "40-second Jerk" display bug
-#         Label rules:
-#           1 device + duration < MIN_GTCS_DURATION  → "Jerk"
-#           1 device + duration >= MIN_GTCS_DURATION → "GTCS"
-#           2+ devices + any duration                → "GTCS"
+# [FIX K] JERK THRESHOLD GUARD ON BACKEND
+#   - If jerk_peak_gps < 5.0 but seizure_flag=True, treat conservatively
+#   - Prevents false positives from minor bumps flagged by base station
+#
+# All previous fixes (v1-v5) preserved.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -125,6 +123,9 @@ sensor_data = sqlalchemy.Table(
     sqlalchemy.Column("gyro_z", sqlalchemy.Float),
     sqlalchemy.Column("battery_percent", sqlalchemy.Integer),
     sqlalchemy.Column("seizure_flag", sqlalchemy.Boolean, default=False),
+    # [FIX J] New columns for richer ML training data
+    sqlalchemy.Column("accel_peak_g", sqlalchemy.Float, nullable=True),
+    sqlalchemy.Column("jerk_peak_gps", sqlalchemy.Float, nullable=True),
 )
 
 device_seizure_sessions = sqlalchemy.Table(
@@ -151,21 +152,17 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-# FIX A: Raised from 30 to 60 seconds
-CONNECTED_THRESHOLD_SECONDS = 60
+# Session timing constants
+CONNECTED_THRESHOLD_SECONDS      = 60
+STALE_SESSION_THRESHOLD_SECONDS  = 120
+MIN_JERK_DURATION_SECONDS        = 3
+MIN_GTCS_DURATION_SECONDS        = 5
+JERK_TO_GTCS_ESCALATION_SECONDS  = 5
 
-# FIX B: Stale session threshold
-STALE_SESSION_THRESHOLD_SECONDS = 120  # 2 minutes
-
-# Minimum time a session must be open before it can be closed
-MIN_JERK_DURATION_SECONDS = 3
-MIN_GTCS_DURATION_SECONDS = 5
-
-# [FIX G] Duration threshold for escalating a single-device Jerk → GTCS
-# A real myoclonic jerk resolves in 1-2 seconds.
-# If a single-device "Jerk" session lasts this long, it's actually a
-# prolonged seizure event and should be labelled GTCS instead.
-JERK_TO_GTCS_ESCALATION_SECONDS = 5
+# [FIX K] Minimum jerk value to consider a seizure flag credible
+# If the base station sends seizure_flag=True but jerk_peak is very low,
+# it may be a transient artifact — we require a minimum signal to act on it.
+MIN_CREDIBLE_JERK_GPS = 5.0   # g/s
 
 
 class UserCreate(BaseModel):
@@ -188,6 +185,7 @@ class DeviceRegister(BaseModel):
 class DeviceUpdate(BaseModel):
     label: str
 
+# [FIX H] Extended payload — new fields from base station v3
 class UnifiedESP32Payload(BaseModel):
     device_id: str
     timestamp_ms: int
@@ -199,6 +197,12 @@ class UnifiedESP32Payload(BaseModel):
     gyro_x: float
     gyro_y: float
     gyro_z: float
+    # New fields (optional for backward compat with old base station firmware)
+    accel_peak_g:  Optional[float] = None
+    jerk_peak_gps: Optional[float] = None
+    gtcs_flag:     Optional[bool]  = None   # base station GTCS determination
+    jerk_flag_raw: Optional[bool]  = None   # base station Jerk determination
+
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -263,9 +267,6 @@ async def get_recent_seizure_data(device_ids: list, anchor_time: datetime, time_
         'device_seizure_counts': device_seizure_counts
     }
 
-# =====================================================================
-# FIX B + D: Stale session cleanup helper
-# =====================================================================
 async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime):
     stale_cutoff = now_utc - timedelta(seconds=STALE_SESSION_THRESHOLD_SECONDS)
 
@@ -300,7 +301,40 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
                 .values(end_time=now_utc)
             )
 
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v5")
+# [FIX I] Determine event type from base station flags + signal values
+def determine_event_type(payload: UnifiedESP32Payload) -> Optional[str]:
+    """
+    Returns 'GTCS', 'Jerk', or None based on the payload flags and signal values.
+
+    Priority:
+    1. If base station says gtcs_flag=True → GTCS
+    2. If base station says jerk_flag_raw=True AND jerk is credible → Jerk
+    3. If seizure_flag=True but no specific flag → treat as Jerk (conservative)
+    4. If jerk_peak is below credibility threshold → None (likely artifact)
+    """
+    if not payload.seizure_flag:
+        return None
+
+    # Check if jerk signal is credible (avoids minor bump false positives)
+    jerk_credible = (
+        payload.jerk_peak_gps is None or  # old firmware, no jerk data → trust seizure_flag
+        payload.jerk_peak_gps >= MIN_CREDIBLE_JERK_GPS
+    )
+
+    if not jerk_credible:
+        print(f"[BACKEND FILTER] jerk_peak={payload.jerk_peak_gps:.2f} g/s < {MIN_CREDIBLE_JERK_GPS} → ignoring flag")
+        return None
+
+    if payload.gtcs_flag is True:
+        return "GTCS"
+    if payload.jerk_flag_raw is True:
+        return "Jerk"
+
+    # Old firmware fallback: no specific flags, just seizure_flag
+    return "Jerk"
+
+
+app = FastAPI(title="Seizure Monitor Backend — MPU6050 v6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -355,7 +389,7 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v5"}
+    return {"message": "Backend running — MPU6050 Seizure Monitor v6"}
 
 @app.post("/api/register")
 async def register(u: UserCreate):
@@ -390,8 +424,8 @@ async def register_device(d: DeviceRegister, current_user=Depends(get_current_us
     my_devices = await database.fetch_all(
         devices.select().where(devices.c.user_id == current_user["id"])
     )
-    if len(my_devices) >= 3:
-        raise HTTPException(status_code=400, detail="Max 3 devices allowed")
+    if len(my_devices) >= 4:
+        raise HTTPException(status_code=400, detail="Max 4 devices allowed")
     if await database.fetch_one(devices.select().where(devices.c.device_id == d.device_id)):
         raise HTTPException(status_code=400, detail="Device ID already exists")
     await database.execute(
@@ -417,7 +451,7 @@ async def get_user_devices(current_user=Depends(get_current_user)):
             .order_by(sensor_data.c.timestamp.desc())
             .limit(1)
         )
-        connected = False
+        connected = battery = False
         battery = 0
         last_sync_display = None
         accel_x = accel_y = accel_z = gyro_x = gyro_y = gyro_z = 0.0
@@ -429,9 +463,9 @@ async def get_user_devices(current_user=Depends(get_current_user)):
             accel_x = latest["accel_x"] or 0.0
             accel_y = latest["accel_y"] or 0.0
             accel_z = latest["accel_z"] or 0.0
-            gyro_x = latest["gyro_x"] or 0.0
-            gyro_y = latest["gyro_y"] or 0.0
-            gyro_z = latest["gyro_z"] or 0.0
+            gyro_x  = latest["gyro_x"]  or 0.0
+            gyro_y  = latest["gyro_y"]  or 0.0
+            gyro_z  = latest["gyro_z"]  or 0.0
             seizure_flag = latest["seizure_flag"] or False
         result.append({
             "id": row["id"],
@@ -473,9 +507,9 @@ async def get_my_devices_with_latest(current_user=Depends(get_current_user)):
             accel_x = latest["accel_x"] or 0.0
             accel_y = latest["accel_y"] or 0.0
             accel_z = latest["accel_z"] or 0.0
-            gyro_x = latest["gyro_x"] or 0.0
-            gyro_y = latest["gyro_y"] or 0.0
-            gyro_z = latest["gyro_z"] or 0.0
+            gyro_x  = latest["gyro_x"]  or 0.0
+            gyro_y  = latest["gyro_y"]  or 0.0
+            gyro_z  = latest["gyro_z"]  or 0.0
             ts_ph = to_pht(latest["timestamp"])
             diff = (now - ts_ph).total_seconds()
             last_sync_val = "Just now" if diff <= 10 else ts_ph.strftime("%I:%M %p")
@@ -614,18 +648,14 @@ async def get_latest_seizure_event(current_user=Depends(get_current_user)):
     }
 
 # =====================================================================
-# ESP32 UPLOAD - v5
-# [FIX G] Jerk sessions that exceed JERK_TO_GTCS_ESCALATION_SECONDS
-#         are reclassified as GTCS when closed.
+# ESP32 UPLOAD — v6
 #
-# Label assignment rules:
-#   Opening:   always opens as "Jerk" when devices_with_seizure == 1
-#   Closing:   checks duration:
-#              < JERK_TO_GTCS_ESCALATION_SECONDS → stays "Jerk"
-#              >= JERK_TO_GTCS_ESCALATION_SECONDS → reclassified to "GTCS"
-#
-# This means a true myoclonic jerk (1-2s) stays labelled "Jerk",
-# and a prolonged single-device event (5s+) becomes "GTCS".
+# Classification flow:
+#   1. determine_event_type() checks base station flags + credibility
+#   2. Decides: GTCS / Jerk / None
+#   3. Opens/maintains/closes sessions accordingly
+#   4. Duration escalation (v5 FIX G) preserved:
+#      - Jerk lasting >= JERK_TO_GTCS_ESCALATION_SECONDS → reclassified GTCS
 # =====================================================================
 @app.post("/api/device/upload")
 async def upload_device_data(payload: UnifiedESP32Payload):
@@ -636,15 +666,23 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         raise HTTPException(status_code=404, detail=f"Device {payload.device_id} not registered")
 
     ts_utc = parse_esp32_timestamp(payload.timestamp_ms)
-    print(f"[UPLOAD] device={payload.device_id} | seizure={payload.seizure_flag} | ts={to_pht(ts_utc).strftime('%H:%M:%S PHT')}")
+    print(
+        f"[UPLOAD] device={payload.device_id} | seizure={payload.seizure_flag} "
+        f"| gtcs={payload.gtcs_flag} | jerk_raw={payload.jerk_flag_raw} "
+        f"| jerk_peak={payload.jerk_peak_gps} g/s "
+        f"| ts={to_pht(ts_utc).strftime('%H:%M:%S PHT')}"
+    )
 
+    # [FIX J] Store extended sensor data
     await database.execute(sensor_data.insert().values(
         device_id=payload.device_id,
         timestamp=ts_utc,
         accel_x=payload.accel_x, accel_y=payload.accel_y, accel_z=payload.accel_z,
-        gyro_x=payload.gyro_x, gyro_y=payload.gyro_y, gyro_z=payload.gyro_z,
+        gyro_x=payload.gyro_x,   gyro_y=payload.gyro_y,   gyro_z=payload.gyro_z,
         battery_percent=payload.battery_percent,
-        seizure_flag=payload.seizure_flag
+        seizure_flag=payload.seizure_flag,
+        accel_peak_g=payload.accel_peak_g,
+        jerk_peak_gps=payload.jerk_peak_gps,
     ))
 
     await database.execute(device_data.insert().values(
@@ -655,6 +693,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             "gyro_x": payload.gyro_x, "gyro_y": payload.gyro_y, "gyro_z": payload.gyro_z,
             "battery_percent": payload.battery_percent,
             "seizure_flag": payload.seizure_flag,
+            "accel_peak_g": payload.accel_peak_g,
+            "jerk_peak_gps": payload.jerk_peak_gps,
+            "gtcs_flag": payload.gtcs_flag,
+            "jerk_flag_raw": payload.jerk_flag_raw,
         })
     ))
 
@@ -667,9 +709,13 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     await close_stale_sessions(user_id, device_ids, now_utc)
 
+    # [FIX I] Use smart event type determination
+    event_type = determine_event_type(payload)
+    effective_seizure = (event_type is not None)
+
     # Per-device seizure session tracking
     active_device = await get_active_device_seizure(payload.device_id)
-    if payload.seizure_flag:
+    if effective_seizure:
         if not active_device:
             await database.execute(
                 device_seizure_sessions.insert().values(
@@ -688,21 +734,21 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     devices_with_seizure = seizure_data['devices_with_seizure']
     device_seizure_counts = seizure_data['device_seizure_counts']
 
-    print(f"[DETECTION] user={user_id} | devices_with_seizure={devices_with_seizure}/{len(device_ids)} | counts={device_seizure_counts}")
+    print(f"[DETECTION] user={user_id} | event_type={event_type} | devices_with_seizure={devices_with_seizure}/{len(device_ids)}")
 
     # ------------------------------------------------------------------
-    # CASE 1: GTCS — 2+ devices with continuous seizure
+    # CASE 1: GTCS — 2+ devices with sustained seizure, OR
+    #         base station explicitly flagged GTCS
     # ------------------------------------------------------------------
-    if devices_with_seizure >= 2:
+    if devices_with_seizure >= 2 or event_type == "GTCS":
         continuous = sum(1 for c in device_seizure_counts.values() if c >= 1)
-        if continuous >= 2:
+        if continuous >= 1 or event_type == "GTCS":
             active_gtcs = await get_active_user_seizure(user_id, "GTCS")
             if not active_gtcs:
                 print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} ***")
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS", start_time=ts_utc, end_time=None
                 ))
-            # Escalate any open Jerk session → GTCS
             active_jerk = await get_active_user_seizure(user_id, "Jerk")
             if active_jerk:
                 jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
@@ -716,11 +762,11 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             return {"status": "saved", "event": "GTCS"}
 
     # ------------------------------------------------------------------
-    # CASE 2: JERK — 1 device with seizure, no active GTCS
+    # CASE 2: JERK — 1 device, event_type=Jerk, no active GTCS
     # ------------------------------------------------------------------
     active_gtcs = await get_active_user_seizure(user_id, "GTCS")
 
-    if devices_with_seizure >= 1 and not active_gtcs:
+    if devices_with_seizure >= 1 and not active_gtcs and event_type in ("Jerk", "GTCS"):
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if not active_jerk:
             print(f"[JERK] *** STARTING JERK SESSION for user {user_id} ***")
@@ -733,14 +779,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
     # ------------------------------------------------------------------
     # CASE 3: NO SEIZURE — close open sessions
-    #
-    # [FIX G] When closing a Jerk session, check its duration:
-    #   < JERK_TO_GTCS_ESCALATION_SECONDS → label stays "Jerk"  (true brief spike)
-    #   >= JERK_TO_GTCS_ESCALATION_SECONDS → reclassify to "GTCS" (prolonged event)
-    #
-    # Example: a 40-second single-device session was previously
-    # labelled "Jerk" which was confusing. Now it becomes "GTCS".
-    # A genuine 2-second myoclonic jerk stays labelled "Jerk".
+    # [FIX G] Duration-based Jerk → GTCS escalation preserved from v5
     # ------------------------------------------------------------------
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
@@ -760,16 +799,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         if active_jerk:
             jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= MIN_JERK_DURATION_SECONDS:
-                # [FIX G] Duration-based label decision
                 if jerk_duration >= JERK_TO_GTCS_ESCALATION_SECONDS:
-                    # Prolonged single-device event → reclassify as GTCS
                     final_label = "GTCS"
-                    print(f"[JERK->GTCS] Reclassifying Jerk as GTCS (duration={jerk_duration:.1f}s >= {JERK_TO_GTCS_ESCALATION_SECONDS}s threshold)")
+                    print(f"[JERK->GTCS] Reclassifying Jerk as GTCS (duration={jerk_duration:.1f}s)")
                 else:
-                    # True brief jerk → keep as Jerk
                     final_label = "Jerk"
                     print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s)")
-
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
@@ -779,6 +814,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 print(f"[JERK] Keeping Jerk open (duration={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
 
     return {"status": "saved", "event": "none"}
+
 
 # =====================================================================
 # ADMIN ROUTES
@@ -838,9 +874,11 @@ async def get_event_sensor_data(
         {
             "timestamp": ts_pht_iso(r["timestamp"]),
             "accel_x": r["accel_x"], "accel_y": r["accel_y"], "accel_z": r["accel_z"],
-            "gyro_x": r["gyro_x"], "gyro_y": r["gyro_y"], "gyro_z": r["gyro_z"],
+            "gyro_x": r["gyro_x"],   "gyro_y": r["gyro_y"],   "gyro_z": r["gyro_z"],
             "battery_percent": r["battery_percent"],
             "seizure_flag": r["seizure_flag"],
+            "accel_peak_g": r["accel_peak_g"],
+            "jerk_peak_gps": r["jerk_peak_gps"],
         }
         for r in rows
     ]
