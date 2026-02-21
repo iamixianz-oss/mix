@@ -23,12 +23,6 @@
 # DURATION-BASED ESCALATION (v5):
 # [FIX G] Jerk sessions lasting >= MIN_GTCS_DURATION_SECONDS
 #         are automatically reclassified as GTCS on close.
-#
-# SD CARD TIMESTAMP BUG (v6):
-# [FIX H] Use now_utc (server receive time) for session start_time/end_time
-#         instead of ts_utc (ESP32 timestamp). When SD card buffers readings
-#         offline, all queued uploads share the same ESP32 timestamp, causing
-#         start_time == end_time and therefore 0-second duration in the app.
 #         Reasoning:
 #           - A true myoclonic jerk lasts 1-2 seconds max
 #           - If 1 device seizes for 5+ seconds = prolonged event
@@ -53,8 +47,10 @@ import json
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_
 from fastapi.responses import StreamingResponse
+from contextlib import asynccontextmanager
 import csv
 import io
+import bcrypt
 
 PHT = timezone(timedelta(hours=8))
 
@@ -212,13 +208,35 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+def hash_password(plain: str) -> str:
+    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode(), hashed.encode())
+    except Exception:
+        return False
+
 async def get_user_by_username(username: str):
     return await database.fetch_one(users.select().where(users.c.username == username))
 
 async def authenticate_user(username: str, password: str):
     user = await get_user_by_username(username)
-    if not user or user["password"] != password:
+    if not user:
         return False
+    # Support legacy plaintext passwords (migration path: rehash on next login)
+    stored = user["password"]
+    if stored.startswith("$2b$") or stored.startswith("$2a$"):
+        if not verify_password(password, stored):
+            return False
+    else:
+        # Plaintext stored (legacy) — compare and rehash transparently
+        if stored != password:
+            return False
+        new_hash = hash_password(password)
+        await database.execute(
+            users.update().where(users.c.username == username).values(password=new_hash)
+        )
     return user
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
@@ -306,18 +324,9 @@ async def close_stale_sessions(user_id: int, device_ids: list, now_utc: datetime
                 .values(end_time=now_utc)
             )
 
-app = FastAPI(title="Seizure Monitor Backend - MPU6050 v5")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     await database.connect()
     print("[STARTUP] Checking for stale open sessions...")
     now_utc = datetime.now(timezone.utc)
@@ -350,10 +359,19 @@ async def startup():
         )
 
     print(f"[STARTUP] Cleaned {len(stale_device)} device + {len(stale_user)} user stale sessions")
-
-@app.on_event("shutdown")
-async def shutdown():
+    yield
+    # Shutdown
     await database.disconnect()
+
+app = FastAPI(title="Seizure Monitor Backend - MPU6050 v6", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/api/health")
 async def health():
@@ -361,14 +379,15 @@ async def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    return {"message": "Backend running - MPU6050 Sensor v5"}
+    return {"message": "Backend running - MPU6050 Sensor v6"}
 
 @app.post("/api/register")
 async def register(u: UserCreate):
     if await get_user_by_username(u.username):
         raise HTTPException(status_code=400, detail="Username already exists")
+    hashed = hash_password(u.password)
     user_id = await database.execute(
-        users.insert().values(username=u.username, password=u.password, is_admin=u.is_admin)
+        users.insert().values(username=u.username, password=hashed, is_admin=u.is_admin)
     )
     return {"id": user_id, "username": u.username}
 
@@ -547,22 +566,6 @@ async def get_latest_event(current_user=Depends(get_current_user)):
         "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None,
     }
 
-@app.get("/api/seizure_events/all")
-async def get_all_seizure_events(current_user=Depends(get_current_user)):
-    rows = await database.fetch_all(
-        user_seizure_sessions.select()
-        .where(user_seizure_sessions.c.user_id == current_user["id"])
-        .order_by(user_seizure_sessions.c.start_time.desc())
-    )
-    return [
-        {
-            "type": r["type"],
-            "start": ts_pht_iso(r["start_time"]),
-            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None,
-        }
-        for r in rows
-    ]
-
 @app.get("/api/seizure_events/download")
 async def download_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
@@ -684,12 +687,10 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             )
     else:
         if active_device:
-            # [FIX H] Use now_utc (server receive time) instead of ts_utc (ESP32 timestamp)
-            # to avoid 0-second duration when SD card buffered readings share the same timestamp
             await database.execute(
                 device_seizure_sessions.update()
                 .where(device_seizure_sessions.c.id == active_device["id"])
-                .values(end_time=now_utc)
+                .values(end_time=ts_utc)
             )
 
     seizure_data = await get_recent_seizure_data(device_ids, anchor_time=ts_utc, time_window_seconds=5)
@@ -708,7 +709,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             if not active_gtcs:
                 print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} ***")
                 await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id, type="GTCS", start_time=now_utc, end_time=None
+                    user_id=user_id, type="GTCS", start_time=ts_utc, end_time=None
                 ))
             # Escalate any open Jerk session → GTCS
             active_jerk = await get_active_user_seizure(user_id, "Jerk")
@@ -733,7 +734,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         if not active_jerk:
             print(f"[JERK] *** STARTING JERK SESSION for user {user_id} ***")
             await database.execute(user_seizure_sessions.insert().values(
-                user_id=user_id, type="Jerk", start_time=now_utc, end_time=None
+                user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
             ))
         else:
             print(f"[JERK] Jerk already active (id={active_jerk['id']}), keeping open")
