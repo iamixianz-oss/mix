@@ -23,6 +23,12 @@
 # DURATION-BASED ESCALATION (v5):
 # [FIX G] Jerk sessions lasting >= MIN_GTCS_DURATION_SECONDS
 #         are automatically reclassified as GTCS on close.
+#
+# SD CARD TIMESTAMP BUG (v6):
+# [FIX H] Use now_utc (server receive time) for session start_time/end_time
+#         instead of ts_utc (ESP32 timestamp). When SD card buffers readings
+#         offline, all queued uploads share the same ESP32 timestamp, causing
+#         start_time == end_time and therefore 0-second duration in the app.
 #         Reasoning:
 #           - A true myoclonic jerk lasts 1-2 seconds max
 #           - If 1 device seizes for 5+ seconds = prolonged event
@@ -678,10 +684,12 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             )
     else:
         if active_device:
+            # [FIX H] Use now_utc (server receive time) instead of ts_utc (ESP32 timestamp)
+            # to avoid 0-second duration when SD card buffered readings share the same timestamp
             await database.execute(
                 device_seizure_sessions.update()
                 .where(device_seizure_sessions.c.id == active_device["id"])
-                .values(end_time=ts_utc)
+                .values(end_time=now_utc)
             )
 
     seizure_data = await get_recent_seizure_data(device_ids, anchor_time=ts_utc, time_window_seconds=5)
@@ -700,7 +708,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             if not active_gtcs:
                 print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} ***")
                 await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id, type="GTCS", start_time=ts_utc, end_time=None
+                    user_id=user_id, type="GTCS", start_time=now_utc, end_time=None
                 ))
             # Escalate any open Jerk session → GTCS
             active_jerk = await get_active_user_seizure(user_id, "Jerk")
@@ -725,7 +733,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
         if not active_jerk:
             print(f"[JERK] *** STARTING JERK SESSION for user {user_id} ***")
             await database.execute(user_seizure_sessions.insert().values(
-                user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
+                user_id=user_id, type="Jerk", start_time=now_utc, end_time=None
             ))
         else:
             print(f"[JERK] Jerk already active (id={active_jerk['id']}), keeping open")
