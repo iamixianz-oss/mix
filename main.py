@@ -566,6 +566,22 @@ async def get_latest_event(current_user=Depends(get_current_user)):
         "end": ts_pht_iso(row["end_time"]) if row["end_time"] else None,
     }
 
+@app.get("/api/seizure_events/all")
+async def get_all_seizure_events(current_user=Depends(get_current_user)):
+    rows = await database.fetch_all(
+        user_seizure_sessions.select()
+        .where(user_seizure_sessions.c.user_id == current_user["id"])
+        .order_by(user_seizure_sessions.c.start_time.desc())
+    )
+    return [
+        {
+            "type": r["type"],
+            "start": ts_pht_iso(r["start_time"]),
+            "end": ts_pht_iso(r["end_time"]) if r["end_time"] else None,
+        }
+        for r in rows
+    ]
+
 @app.get("/api/seizure_events/download")
 async def download_seizure_events(current_user=Depends(get_current_user)):
     rows = await database.fetch_all(
