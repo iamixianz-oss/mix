@@ -25,6 +25,12 @@
 #         - start_time: ts_utc (event time)
 #         - end_time: ts_utc (event time)
 #         - duration: now_utc delta (server time, reliable)
+#
+# DURATION-BASED CLASSIFICATION (v5):
+# [FIX G] Seizure type now determined by duration + device count:
+#         - 1 device seizing:   < 30s = Jerk, >= 30s = GTCS
+#         - 2+ devices seizing: < 15s = Jerk, >= 15s = GTCS
+#         Jerk sessions are auto-upgraded to GTCS when threshold is met.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -158,6 +164,12 @@ STALE_SESSION_THRESHOLD_SECONDS = 120  # 2 minutes
 # Minimum time a session must be open before it can be closed
 MIN_JERK_DURATION_SECONDS = 3
 MIN_GTCS_DURATION_SECONDS = 5
+
+# [FIX G] Duration-based classification thresholds
+# 1 device seizing:   seizure_duration >= this → upgrade Jerk to GTCS
+GTCS_THRESHOLD_1_DEVICE_SECONDS = 30
+# 2+ devices seizing: seizure_duration >= this → upgrade Jerk to GTCS
+GTCS_THRESHOLD_MULTI_DEVICE_SECONDS = 15
 
 
 class UserCreate(BaseModel):
@@ -713,80 +725,94 @@ async def upload_device_data(payload: UnifiedESP32Payload):
     print(f"[DETECTION] user={user_id} | devices_with_seizure={devices_with_seizure}/{len(device_ids)} | counts={device_seizure_counts}")
 
     # ------------------------------------------------------------------
-    # CASE 1: GTCS - 2+ devices with seizure AND 2+ are continuous
+    # [FIX G] DURATION-BASED CLASSIFICATION (v5)
+    #
+    # The seizure TYPE is now determined by:
+    #   - How many devices are currently seizing (devices_with_seizure)
+    #   - How long the current seizure session has been active (duration)
+    #
+    # Rules:
+    #   1 device  seizing: < 30s = Jerk,  >= 30s = GTCS
+    #   2+ devices seizing: < 15s = Jerk, >= 15s = GTCS
+    #
+    # Flow:
+    #   - When seizure first detected → always open a Jerk session first
+    #   - On every subsequent upload → check duration against threshold
+    #   - If threshold met → close Jerk, open GTCS (escalate)
+    #   - If devices drop to 0 → close whatever is open
     # ------------------------------------------------------------------
-    if devices_with_seizure >= 2:
-        continuous = sum(1 for c in device_seizure_counts.values() if c >= 1)
-        if continuous >= 2:
-            active_gtcs = await get_active_user_seizure(user_id, "GTCS")
-            if not active_gtcs:
+
+    if devices_with_seizure >= 1:
+        active_gtcs = await get_active_user_seizure(user_id, "GTCS")
+        active_jerk = await get_active_user_seizure(user_id, "Jerk")
+
+        # Determine which duration threshold applies
+        if devices_with_seizure >= 2:
+            gtcs_threshold = GTCS_THRESHOLD_MULTI_DEVICE_SECONDS
+        else:
+            gtcs_threshold = GTCS_THRESHOLD_1_DEVICE_SECONDS
+
+        if active_gtcs:
+            # Already in GTCS — just keep it open
+            print(f"[GTCS] Active GTCS continuing (devices={devices_with_seizure})")
+            return {"status": "saved", "event": "GTCS"}
+
+        if active_jerk:
+            jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
+            print(f"[JERK] Active Jerk duration={jerk_duration:.1f}s | threshold={gtcs_threshold}s | devices={devices_with_seizure}")
+
+            if jerk_duration >= gtcs_threshold:
+                # Duration threshold met — escalate Jerk → GTCS
+                print(f"[JERK->GTCS] Escalating: duration={jerk_duration:.1f}s >= {gtcs_threshold}s with {devices_with_seizure} device(s)")
+                await database.execute(
+                    user_seizure_sessions.update()
+                    .where(user_seizure_sessions.c.id == active_jerk["id"])
+                    .values(end_time=ts_utc)
+                )
                 print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} ***")
                 await database.execute(user_seizure_sessions.insert().values(
                     user_id=user_id, type="GTCS", start_time=ts_utc, end_time=None
                 ))
-            # Escalate from Jerk to GTCS
-            active_jerk = await get_active_user_seizure(user_id, "Jerk")
-            if active_jerk:
-                # Use now_utc for duration calculation but ts_utc for end_time
-                # Duration is relative to server time (reliable), but end_time marks the actual event
-                jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
-                if jerk_duration >= MIN_JERK_DURATION_SECONDS:
-                    print(f"[JERK->GTCS] Closing Jerk (duration={jerk_duration:.1f}s), GTCS takes over")
-                    await database.execute(
-                        user_seizure_sessions.update()
-                        .where(user_seizure_sessions.c.id == active_jerk["id"])
-                        .values(end_time=ts_utc)
-                    )
-            return {"status": "saved", "event": "GTCS"}
+                return {"status": "saved", "event": "GTCS"}
+            else:
+                # Still within Jerk window
+                print(f"[JERK] Keeping Jerk open (id={active_jerk['id']}), not yet at threshold")
+                return {"status": "saved", "event": "Jerk"}
 
-    # ------------------------------------------------------------------
-    # CASE 2: JERK - 1 device with seizure, no active GTCS
-    # FIX BUG 3: Removed GTCS reopen logic.
-    # ------------------------------------------------------------------
-    active_gtcs = await get_active_user_seizure(user_id, "GTCS")
-
-    if devices_with_seizure >= 1 and not active_gtcs:
-        active_jerk = await get_active_user_seizure(user_id, "Jerk")
-        if not active_jerk:
-            print(f"[JERK] *** STARTING JERK SESSION for user {user_id} ***")
+        else:
+            # No active session — start a new Jerk session
+            print(f"[JERK] *** STARTING JERK SESSION for user {user_id} (devices={devices_with_seizure}) ***")
             await database.execute(user_seizure_sessions.insert().values(
                 user_id=user_id, type="Jerk", start_time=ts_utc, end_time=None
             ))
-        else:
-            print(f"[JERK] Jerk already active (id={active_jerk['id']}), keeping open")
-        return {"status": "saved", "event": "Jerk"}
+            return {"status": "saved", "event": "Jerk"}
 
     # ------------------------------------------------------------------
-    # CASE 3: NO SEIZURE - close sessions if minimum duration met
-    # FIX: Use now_utc for duration (reliable server time)
-    #      but ts_utc for end_time (actual event time)
-    # This ensures queued data has accurate session end times.
+    # CASE: NO SEIZURE - close any open sessions if minimum duration met
     # ------------------------------------------------------------------
     if devices_with_seizure == 0:
         active_gtcs = await get_active_user_seizure(user_id, "GTCS")
         if active_gtcs:
-            # Duration relative to server time (reliable)
             gtcs_duration = (now_utc - active_gtcs["start_time"]).total_seconds()
             if gtcs_duration >= MIN_GTCS_DURATION_SECONDS:
                 print(f"[GTCS] Closing GTCS (duration={gtcs_duration:.1f}s)")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                    .values(end_time=ts_utc)  # Use ESP32 time for end_time
+                    .values(end_time=ts_utc)
                 )
             else:
                 print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
 
         active_jerk = await get_active_user_seizure(user_id, "Jerk")
         if active_jerk:
-            # Duration relative to server time (reliable)
             jerk_duration = (now_utc - active_jerk["start_time"]).total_seconds()
             if jerk_duration >= MIN_JERK_DURATION_SECONDS:
                 print(f"[JERK] Closing Jerk (duration={jerk_duration:.1f}s)")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc)  # Use ESP32 time for end_time
+                    .values(end_time=ts_utc)
                 )
             else:
                 print(f"[JERK] Keeping Jerk open (duration={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
