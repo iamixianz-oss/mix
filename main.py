@@ -706,7 +706,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
             await database.execute(
                 device_seizure_sessions.update()
                 .where(device_seizure_sessions.c.id == active_device["id"])
-                .values(end_time=ts_utc)
+                .values(end_time=now_utc)
             )
 
     seizure_data = await get_recent_seizure_data(device_ids, anchor_time=ts_utc, time_window_seconds=5)
@@ -736,7 +736,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                     await database.execute(
                         user_seizure_sessions.update()
                         .where(user_seizure_sessions.c.id == active_jerk["id"])
-                        .values(end_time=ts_utc)
+                        .values(end_time=now_utc)
                     )
             return {"status": "saved", "event": "GTCS"}
 
@@ -776,7 +776,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_gtcs["id"])
-                    .values(end_time=ts_utc)
+                    .values(end_time=now_utc)
                 )
             else:
                 print(f"[GTCS] Keeping GTCS open (duration={gtcs_duration:.1f}s < min {MIN_GTCS_DURATION_SECONDS}s)")
@@ -798,7 +798,7 @@ async def upload_device_data(payload: UnifiedESP32Payload):
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc, type=final_label)
+                    .values(end_time=now_utc, type=final_label)
                 )
             else:
                 print(f"[JERK] Keeping Jerk open (duration={jerk_duration:.1f}s < min {MIN_JERK_DURATION_SECONDS}s)")
