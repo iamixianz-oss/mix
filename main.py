@@ -31,6 +31,12 @@
 #         - 1 device seizing:   < 30s = Jerk, >= 30s = GTCS
 #         - 2+ devices seizing: < 15s = Jerk, >= 15s = GTCS
 #         Jerk sessions are auto-upgraded to GTCS when threshold is met.
+#
+# JERK→GTCS ESCALATION FIX (v5.1):
+# [FIX H] When Jerk escalates to GTCS, the existing Jerk DB row is
+#         UPDATED (type changed to "GTCS") instead of closing it and
+#         inserting a new GTCS row. This means the app shows ONE event
+#         (GTCS) with the original start time — not two separate entries.
 # =====================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -763,16 +769,17 @@ async def upload_device_data(payload: UnifiedESP32Payload):
 
             if jerk_duration >= gtcs_threshold:
                 # Duration threshold met — escalate Jerk → GTCS
+                # Instead of closing Jerk + inserting a new GTCS row,
+                # UPDATE the existing Jerk row: change type to "GTCS", keep start_time.
+                # Result: app shows ONE event (GTCS) with the original Jerk start time,
+                # not two separate Jerk + GTCS entries.
                 print(f"[JERK->GTCS] Escalating: duration={jerk_duration:.1f}s >= {gtcs_threshold}s with {devices_with_seizure} device(s)")
+                print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} (converted from Jerk id={active_jerk['id']}, keeping start_time) ***")
                 await database.execute(
                     user_seizure_sessions.update()
                     .where(user_seizure_sessions.c.id == active_jerk["id"])
-                    .values(end_time=ts_utc)
+                    .values(type="GTCS")  # Keep same row + same start_time, just change type
                 )
-                print(f"[GTCS] *** STARTING GTCS SESSION for user {user_id} ***")
-                await database.execute(user_seizure_sessions.insert().values(
-                    user_id=user_id, type="GTCS", start_time=ts_utc, end_time=None
-                ))
                 return {"status": "saved", "event": "GTCS"}
             else:
                 # Still within Jerk window
